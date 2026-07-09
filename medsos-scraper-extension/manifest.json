@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Social Post Data Collector",
+  "description": "Mengambil data dasar postingan Instagram, TikTok, dan Facebook yang terlihat di browser user dan menyimpannya secara lokal.",
+  "version": "0.3.0",
+  "permissions": ["activeTab", "storage", "downloads"],
+  "host_permissions": ["https://www.instagram.com/*", "https://www.tiktok.com/*", "https://www.facebook.com/*", "https://web.facebook.com/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Social Collector"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.instagram.com/*", "https://www.tiktok.com/*", "https://www.facebook.com/*", "https://web.facebook.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Social Collector</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="header">
+        <div>
+          <h1>Social Collector</h1>
+          <p>Instagram, TikTok, Facebook: caption, jenis, like, komen, tanggal.</p>
+        </div>
+        <span id="stateBadge" class="badge">Idle</span>
+      </header>
+
+      <section class="controls" aria-label="Kontrol scraping">
+        <label>
+          Platform
+          <select id="platformSelect">
+            <option value="auto" selected>Deteksi dari tab aktif</option>
+            <option value="instagram">Instagram</option>
+            <option value="tiktok">TikTok</option>
+            <option value="facebook">Facebook</option>
+          </select>
+        </label>
+        <label>
+          Tanggal batas
+          <input id="untilDate" type="date" required>
+        </label>
+        <div class="field-row">
+          <label>
+            Maks. post
+            <input id="maxPosts" type="number" min="1" max="1000" value="100">
+          </label>
+          <label>
+            Jeda
+            <select id="delayMs">
+              <option value="900">Cepat</option>
+              <option value="1400" selected>Normal</option>
+              <option value="2200">Pelan</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="button-row">
+          <button id="startBtn" class="primary" type="button">Mulai</button>
+          <button id="stopBtn" type="button">Stop</button>
+          <button id="exportBtn" type="button">Export Excel</button>
+        </div>
+        <button id="clearBtn" class="ghost" type="button">Bersihkan hasil lokal</button>
+      </section>
+
+      <section class="status" aria-live="polite">
+        <strong id="statusTitle">Siap</strong>
+        <span id="statusText">Buka profil/halaman Instagram, TikTok, atau Facebook target, lalu klik Mulai.</span>
+      </section>
+
+      <section class="summary">
+        <div>
+          <span id="countValue">0</span>
+          <small>post tersimpan</small>
+        </div>
+        <div>
+          <span id="lastDate">-</span>
+          <small>tanggal terakhir</small>
+        </div>
+      </section>
+
+      <section class="results" aria-label="Hasil scraping">
+        <table>
+          <thead>
+            <tr>
+              <th>Post</th>
+              <th>Platform</th>
+              <th>Jenis</th>
+              <th>Like</th>
+              <th>Komen</th>
+              <th>Tanggal</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody">
+            <tr>
+              <td colspan="6" class="empty">Belum ada data.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
