@@ -1,8 +1,6 @@
 (() => {
   const STORAGE_RESULTS = "social_scraper_results";
   const STORAGE_STATUS = "social_scraper_status";
-  const LEGACY_RESULTS = "igs_results";
-  const LEGACY_STATUS = "igs_status";
 
   const PLATFORM_CONFIG = {
     instagram: {
@@ -39,13 +37,13 @@
   };
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type === "SCS_START" || message?.type === "IGS_START") {
+    if (message?.type === "SCS_START") {
       start(message.payload || {});
       sendResponse({ ok: true });
       return true;
     }
 
-    if (message?.type === "SCS_STOP" || message?.type === "IGS_STOP") {
+    if (message?.type === "SCS_STOP") {
       stop("Dihentikan", "Proses dihentikan oleh user.");
       sendResponse({ ok: true });
       return true;
@@ -66,12 +64,8 @@
       return;
     }
 
-    const stored = await chrome.storage.local.get([STORAGE_RESULTS, LEGACY_RESULTS]);
-    const existing = Array.isArray(stored[STORAGE_RESULTS])
-      ? stored[STORAGE_RESULTS]
-      : Array.isArray(stored[LEGACY_RESULTS])
-        ? stored[LEGACY_RESULTS]
-        : [];
+    const stored = await chrome.storage.local.get([STORAGE_RESULTS]);
+    const existing = Array.isArray(stored[STORAGE_RESULTS]) ? stored[STORAGE_RESULTS] : [];
 
     run = {
       active: true,
@@ -80,6 +74,7 @@
       results: existing,
       addedCount: 0,
       options: {
+        startDate: options.startDate || "",
         untilDate: options.untilDate || "",
         maxPosts: clamp(Number(options.maxPosts || 100), 1, 1000),
         delayMs: clamp(Number(options.delayMs || 1400), 600, 5000)
@@ -103,7 +98,13 @@
   }
 
   async function scrapeLoop() {
+    const startDate = parseStartDate(run.options.startDate);
     const cutoff = parseCutoff(run.options.untilDate);
+    if (run.platform === "facebook") {
+      await scrapeFacebookFeedLoop(startDate, cutoff);
+      return;
+    }
+
     let staleScrolls = 0;
 
     while (run.active && run.addedCount < run.options.maxPosts) {
@@ -137,8 +138,18 @@
 
       const postData = await scrapePostFromLink(nextLink, postUrl, linkContext);
       if (postData) {
+        if (isNewerThanStartDate(startDate, postData)) {
+          await setStatus(
+            "running",
+            "Lewati post terbaru",
+            `Post ${formatDateForStatus(postData.postedAt)} lebih baru dari tanggal mulai, jadi belum disimpan.`
+          );
+          await sleep(run.options.delayMs);
+          continue;
+        }
+
         if (isOlderThanCutoff(cutoff, postData)) {
-          if (postData.isPinned || postData.isTopGridCandidate) {
+          if (shouldSkipOldPostWithoutStopping(postData)) {
             await setStatus(
               "running",
               "Lewati post lama",
@@ -166,6 +177,89 @@
     await stop("Selesai", `Mengambil ${run.addedCount} post baru.`);
   }
 
+  async function scrapeFacebookFeedLoop(startDate, cutoff) {
+    let staleScrolls = 0;
+
+    while (run.active && run.addedCount < run.options.maxPosts) {
+      const articles = collectFacebookFeedArticles();
+      let processedVisibleArticle = false;
+
+      for (let index = 0; index < articles.length && run.active && run.addedCount < run.options.maxPosts; index += 1) {
+        const article = articles[index];
+        const postUrl = getPostElementUrl("facebook", article);
+        if (!postUrl || run.seen.has(postUrl)) continue;
+
+        processedVisibleArticle = true;
+        run.seen.add(postUrl);
+
+        const linkContext = {
+          gridIndex: index,
+          isPinned: isLikelyPinnedPostLink(article, index, "facebook")
+        };
+
+        await setStatus(
+          "running",
+          "Membaca post Facebook",
+          `Mengambil data ke-${run.addedCount + 1}: ${getPostId("facebook", postUrl) || postUrl}`
+        );
+
+        const postData = await scrapeFacebookPostFromLink(article, postUrl, linkContext);
+        if (!postData) {
+          await sleep(run.options.delayMs);
+          continue;
+        }
+
+        if (isNewerThanStartDate(startDate, postData)) {
+          await setStatus(
+            "running",
+            "Lewati post terbaru",
+            `Post ${formatDateForStatus(postData.postedAt)} lebih baru dari tanggal mulai, jadi belum disimpan.`
+          );
+          await sleep(run.options.delayMs);
+          continue;
+        }
+
+        if (isOlderThanCutoff(cutoff, postData)) {
+          if (shouldSkipOldPostWithoutStopping(postData)) {
+            await setStatus(
+              "running",
+              "Lewati post lama",
+              `Post ${formatDateForStatus(postData.postedAt)} lebih lama dari batas dan dilewati agar post biasa tetap diproses.`
+            );
+            await sleep(run.options.delayMs);
+            continue;
+          }
+
+          await stop(
+            "Mencapai tanggal batas",
+            `Post ${formatDateForStatus(postData.postedAt)} lebih lama dari tanggal batas, jadi tidak disimpan.`
+          );
+          return;
+        }
+
+        run.results.push(postData);
+        run.addedCount += 1;
+        await chrome.storage.local.set({ [STORAGE_RESULTS]: run.results });
+        await sleep(run.options.delayMs);
+      }
+
+      if (!run.active || run.addedCount >= run.options.maxPosts) {
+        break;
+      }
+
+      const lastArticle = articles.at(-1) || null;
+      const moved = await scrollForMorePosts(lastArticle);
+      staleScrolls = moved ? 0 : staleScrolls + 1;
+
+      if (staleScrolls >= 4 || (!processedVisibleArticle && !moved)) {
+        await stop("Selesai", "Tidak ada post Facebook baru yang terlihat setelah beberapa kali scroll.");
+        return;
+      }
+    }
+
+    await stop("Selesai", `Mengambil ${run.addedCount} post baru.`);
+  }
+
   function resolvePlatform(requestedPlatform) {
     if (requestedPlatform && PLATFORM_CONFIG[requestedPlatform]) return requestedPlatform;
     if (location.hostname.includes("instagram.com")) return "instagram";
@@ -181,6 +275,20 @@
     return !Number.isNaN(postedDate.getTime()) && postedDate < cutoff;
   }
 
+  function isNewerThanStartDate(startDate, postData) {
+    if (!startDate || !postData?.postedAt) return false;
+
+    const postedDate = new Date(postData.postedAt);
+    return !Number.isNaN(postedDate.getTime()) && postedDate > startDate;
+  }
+
+  function shouldSkipOldPostWithoutStopping(postData) {
+    if (!postData) return false;
+    if (postData.isPinned) return true;
+    if (postData.platform === "facebook") return false;
+    return Boolean(postData.isTopGridCandidate);
+  }
+
   function formatDateForStatus(value) {
     if (!value) return "tanpa tanggal";
     const date = new Date(value);
@@ -190,7 +298,11 @@
 
   function collectPostLinks(platform) {
     if (platform === "facebook") {
-      return collectFacebookPostLinks();
+      return collectFacebookFeedArticles();
+    }
+
+    if (platform === "tiktok" && isProfilePage("tiktok")) {
+      return collectTikTokProfileLinks();
     }
 
     const config = PLATFORM_CONFIG[platform];
@@ -203,16 +315,86 @@
     return [...unique.values()];
   }
 
-  function collectFacebookPostLinks() {
+  function collectTikTokProfileLinks() {
     const unique = new Map();
-    const rootCandidates = [
-      ...document.querySelectorAll('[role="article"], article, div[data-pagelet^="FeedUnit"]'),
-      ...[...document.querySelectorAll('[data-ad-preview="message"], [data-ad-comet-preview="message"], [data-testid="post_message"]')]
-        .map((node) => node.closest('[role="article"], article, div[data-pagelet^="FeedUnit"]') || climbToTextBlock(node, 8))
-        .filter(Boolean)
-    ];
-    const postRoots = [...new Set(rootCandidates)]
-      .filter(isLikelyFacebookPostRoot);
+    const roots = [...document.querySelectorAll('[data-e2e="user-post-item"]')];
+
+    roots.forEach((root) => {
+      if (isTikTokRecommendationCard(root)) return;
+
+      const link = [...root.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]')]
+        .find((candidate) => isTikTokProfilePostLink(candidate));
+      if (!link) return;
+
+      const href = cleanPostUrl("tiktok", link.href);
+      if (!href || !getPostId("tiktok", href)) return;
+      unique.set(href, link);
+    });
+
+    if (unique.size > 0) {
+      return [...unique.values()];
+    }
+
+    document.querySelectorAll(PLATFORM_CONFIG.tiktok.postLinkSelector).forEach((link) => {
+      if (!isTikTokProfilePostLink(link)) return;
+
+      const href = cleanPostUrl("tiktok", link.href);
+      if (!href || !getPostId("tiktok", href)) return;
+      unique.set(href, link);
+    });
+
+    return [...unique.values()];
+  }
+
+  function isTikTokProfilePostLink(link) {
+    if (!link?.href) return false;
+
+    const href = cleanPostUrl("tiktok", link.href);
+    const profileHandle = getTikTokProfileHandle();
+    if (!href || !profileHandle) return false;
+
+    const path = getPathname(href);
+    if (!new RegExp(`^/${escapeRegex(profileHandle)}/(?:video|photo)/[^/]+$`, "i").test(path)) {
+      return false;
+    }
+
+    const root = link.closest('[data-e2e="user-post-item"]') || getPostCardRoot(link);
+    if (isTikTokRecommendationCard(root)) return false;
+
+    return isElementVisiblyRenderable(link);
+  }
+
+  function isTikTokRecommendationCard(root) {
+    if (!root) return false;
+    if (root.closest?.('[data-e2e*="recommend" i]')) return true;
+
+    let node = root;
+    for (let depth = 0; node && depth < 4; depth += 1) {
+      const text = normalizeText(node.innerText || node.textContent || "").toLowerCase();
+      if (/\b(you may like|recommended|for you|mungkin anda suka|untuk anda|disarankan untuk anda)\b/i.test(text)) {
+        return true;
+      }
+      node = node.parentElement;
+    }
+
+    return false;
+  }
+
+  function getTikTokProfileHandle() {
+    const match = location.pathname.match(/^\/(@[^/]+)\/?$/i);
+    return match?.[1] || "";
+  }
+
+  function collectFacebookFeedArticles() {
+    const unique = new Map();
+    const articleRoots = [...document.querySelectorAll('[role="article"], article, div[data-pagelet^="FeedUnit"]')];
+    const contextualRoots = [...document.querySelectorAll('[data-ad-preview="message"], [data-ad-comet-preview="message"], [data-testid="post_message"]')]
+      .map((node) => node.closest('[role="article"], article, div[data-pagelet^="FeedUnit"]') || normalizeFacebookPostRoot(findFacebookPostRootFromNode(node)))
+      .filter(Boolean);
+    const postRoots = [...new Set([...articleRoots, ...contextualRoots])]
+      .filter(isLikelyFacebookPostRoot)
+      .filter(isVisibleFacebookFeedRoot)
+      .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
 
     postRoots.forEach((root, index) => {
       const link = findBestFacebookPostLink(root);
@@ -223,10 +405,187 @@
       if (!href || !postId) return;
 
       root.__scsPostHref = href;
-      unique.set(href, root);
+      const existing = unique.get(href);
+      if (!existing || scoreFacebookExtractionRootQuality(root) >= scoreFacebookExtractionRootQuality(existing)) {
+        unique.set(href, root);
+      }
     });
 
     return [...unique.values()];
+  }
+
+  function scoreFacebookExtractionRootQuality(root) {
+    if (!root) return -Infinity;
+
+    let score = 0;
+    const headerBand = getFacebookHeaderBand(root);
+    const authorNode = findFacebookAuthorNode(root, headerBand);
+    const rawDateText = extractFacebookRawDateText(root);
+    const caption = extractFacebookCaption(root);
+    const bestLink = findBestFacebookPostLink(root);
+    const text = normalizeText(root.innerText || root.textContent || "");
+
+    if (authorNode) score += 160;
+    if (rawDateText) score += 260;
+    if (caption) score += 120;
+    if (bestLink) score += 60;
+    if (/\b(like|comment|share|suka|komentar|bagikan)\b/i.test(text)) score += 40;
+    if (root.querySelector('[data-ad-preview="message"], [data-ad-comet-preview="message"], [data-testid="post_message"]')) score += 40;
+
+    return score;
+  }
+
+  function resolveFacebookStablePostRoot(linkOrRoot, fallbackRoot = null) {
+    const candidates = [
+      getFacebookPostCardRoot(linkOrRoot),
+      fallbackRoot
+    ]
+      .filter(Boolean)
+      .map((root) => normalizeFacebookPostRoot(root))
+      .filter(Boolean)
+      .filter((root, index, array) => array.indexOf(root) === index);
+
+    return candidates.sort((a, b) => scoreFacebookExtractionRootQuality(b) - scoreFacebookExtractionRootQuality(a))[0] || null;
+  }
+
+  function dispatchFacebookHoverEvents(node) {
+    if (!node?.dispatchEvent) return;
+
+    const rect = node.getBoundingClientRect?.();
+    const clientX = rect ? rect.left + Math.min(rect.width / 2, 16) : 0;
+    const clientY = rect ? rect.top + Math.min(rect.height / 2, 16) : 0;
+    ["mouseenter", "mouseover", "mousemove"].forEach((eventName) => {
+      try {
+        node.dispatchEvent(new MouseEvent(eventName, {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX,
+          clientY
+        }));
+      } catch {
+        // Ignore event dispatch failures on experimental Facebook nodes.
+      }
+    });
+  }
+
+  function collectFacebookHeaderProbeTargets(root) {
+    if (!root) return [];
+
+    const headerBand = getFacebookHeaderBand(root);
+    const authorNode = findFacebookAuthorNode(root, headerBand);
+    const authorHref = cleanPostUrl("facebook", authorNode?.href || authorNode?.closest?.("a[href]")?.href || "");
+    const messageContainer = getFacebookMessageContainer(root);
+    const candidates = [
+      ...collectFacebookHeaderDateCandidates(root),
+      ...collectFacebookAuthorAdjacentNodes(authorNode, root).map((node) => ({ node, score: 0 }))
+    ]
+      .map((item) => item?.node || item)
+      .filter(Boolean)
+      .concat([...root.querySelectorAll('span, div, abbr, time, a[href], [aria-labelledby], [aria-label], [title], [data-tooltip-content], [data-utime]')]
+        .filter((node) => isNodeInsideFacebookHeaderBand(node, headerBand)));
+
+    return candidates
+      .filter((node, index, array) => array.indexOf(node) === index)
+      .filter((node) => {
+        if (node === authorNode) return false;
+        if (messageContainer?.contains(node) && node !== messageContainer) return false;
+        if (node.querySelector?.("img, video")) return false;
+
+        const rect = node.getBoundingClientRect?.();
+        if (!rect || rect.width > 260 || rect.height > 44) return false;
+
+        const href = cleanPostUrl("facebook", node.href || node.closest?.("a[href]")?.href || "");
+        if (authorHref && href && getComparableFacebookUrl(href) === getComparableFacebookUrl(authorHref)) return false;
+        return true;
+      })
+      .map((node) => {
+        const rect = node.getBoundingClientRect?.();
+        const authorRect = authorNode?.getBoundingClientRect?.();
+        const text = collectFacebookDirectDateText(node, authorNode) || normalizeText(node.innerText || node.textContent || "");
+        const token = extractFacebookDateToken(text);
+        const href = cleanPostUrl("facebook", node.href || "");
+        let score = 0;
+
+        if (token) score += 260;
+        if (node.hasAttribute?.("aria-labelledby") || node.hasAttribute?.("aria-describedby")) score += 120;
+        if (node.tagName?.toLowerCase() !== "a") score += 40;
+        if (href && /\/posts\/|\/permalink\/|permalink\.php|story_fbid=|\/videos\/|\/watch\/|\/reel\/|\/photo\//i.test(href)) score += 70;
+        if (rect && authorRect) {
+          score -= Math.min(120, Math.abs(rect.top - authorRect.bottom) * 2);
+          score -= Math.min(80, Math.abs(rect.left - authorRect.left));
+        }
+
+        return { node, score };
+      })
+      .sort((a, b) => b.score - a.score)
+      .map((item) => item.node);
+  }
+
+  function getFacebookHeaderInteractionTarget(root) {
+    return collectFacebookHeaderProbeTargets(root)[0]
+      || findFacebookTimestampLink(root)
+      || findBestFacebookPostLink(root)
+      || null;
+  }
+
+  function getFacebookHeaderAnchor(root) {
+    if (!root) return null;
+
+    const headerBand = getFacebookHeaderBand(root);
+    return getFacebookHeaderInteractionTarget(root)
+      || findFacebookAuthorNode(root, headerBand)
+      || root;
+  }
+
+  function scrollFacebookHeaderIntoView(root) {
+    const target = getFacebookHeaderAnchor(root);
+    if (!target?.scrollIntoView) return;
+
+    target.scrollIntoView({ block: "start", inline: "nearest" });
+    try {
+      window.scrollBy({ top: -120, left: 0, behavior: "auto" });
+    } catch {
+      window.scrollBy(0, -120);
+    }
+  }
+
+  async function primeFacebookPostHeader(root) {
+    if (!root) return;
+
+    const target = getFacebookHeaderInteractionTarget(root);
+    if (!target) return;
+
+    scrollFacebookHeaderIntoView(root);
+    try {
+      target.focus?.({ preventScroll: true });
+    } catch {
+      // Some Facebook nodes do not support focus options.
+    }
+    dispatchFacebookHoverEvents(target);
+    await sleep(220);
+  }
+
+  async function stabilizeFacebookPostDate(linkOrRoot) {
+    let bestRoot = resolveFacebookStablePostRoot(linkOrRoot) || getFacebookPostCardRoot(linkOrRoot);
+    if (extractFacebookRawDateText(bestRoot)) return bestRoot;
+
+    // Facebook often hydrates the header timestamp link after the card is visible.
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      await primeFacebookPostHeader(bestRoot);
+      await sleep(attempt === 0 ? 420 : 260);
+
+      const resolvedRoot = resolveFacebookStablePostRoot(linkOrRoot, bestRoot) || bestRoot;
+      if (scoreFacebookExtractionRootQuality(resolvedRoot) >= scoreFacebookExtractionRootQuality(bestRoot)) {
+        bestRoot = resolvedRoot;
+      }
+
+      if (extractFacebookRawDateText(bestRoot)) {
+        return bestRoot;
+      }
+    }
+
+    return bestRoot;
   }
 
   function getPostElementUrl(platform, element) {
@@ -241,6 +600,10 @@
     const label = collectNearbyLabels(link).toLowerCase();
     if (/(^|\s)(pinned|pin post|pinned post|disematkan|sematan|sematkan)(\s|$)/i.test(label)) {
       return true;
+    }
+
+    if (platform === "facebook") {
+      return false;
     }
 
     return isProfilePage(platform) && index >= 0 && index < 3;
@@ -303,7 +666,7 @@
     expandCaptionText(getPostRoot(run.platform) || document);
     await sleep(250);
 
-    const data = extractVisiblePostData(postUrl, {
+    const data = extractInstagramVisiblePostData(postUrl, {
       ...linkContext,
       previewType: detectPreviewType(link, postUrl, run.platform)
     });
@@ -343,18 +706,6 @@
 
     await closePost(beforeUrl, run.platform);
     return mergeTikTokPostData(cardData, detailData);
-  }
-
-  function extractVisiblePostData(fallbackUrl, linkContext = {}) {
-    if (run.platform === "tiktok") {
-      return extractTikTokVisiblePostData(fallbackUrl, linkContext);
-    }
-
-    if (run.platform === "facebook") {
-      return extractFacebookVisiblePostData(fallbackUrl, linkContext);
-    }
-
-    return extractInstagramVisiblePostData(fallbackUrl, linkContext);
   }
 
   function extractInstagramVisiblePostData(fallbackUrl, linkContext = {}) {
@@ -539,56 +890,29 @@
   }
 
   async function scrapeFacebookPostFromLink(link, postUrl, linkContext = {}) {
-    link.scrollIntoView({ block: "center", inline: "center" });
+    let root = resolveFacebookStablePostRoot(link) || getFacebookPostCardRoot(link);
+    scrollFacebookHeaderIntoView(root);
     await sleep(450);
-    expandCaptionText(getFacebookPostCardRoot(link) || document);
-    await sleep(250);
-    return extractFacebookCardData(link, postUrl, linkContext);
+    root = resolveFacebookStablePostRoot(link, root) || root;
+    root = await stabilizeFacebookPostDate(root);
+    const preservedRawDateText = extractFacebookRawDateText(root);
+    const preservedPostedAt = extractFacebookDate(root);
+    await expandFacebookCaptionText(root || document);
+    return extractFacebookCardData(root, postUrl, linkContext, {
+      rawDateText: preservedRawDateText,
+      postedAt: preservedPostedAt
+    });
   }
 
-  function extractFacebookVisiblePostData(fallbackUrl, linkContext = {}) {
-    const url = cleanPostUrl("facebook", isFacebookPostUrl(location.href) ? location.href : fallbackUrl);
-    const postId = getPostId("facebook", url);
-    const root = getFacebookPostRoot(postId) || document;
-    const text = normalizeText(root.innerText || root.textContent || "");
-    const reactionInfo = extractFacebookReactionCount(root, text);
-    const commentInfo = extractFacebookCommentCount(root, text);
-    const shareInfo = extractFacebookCountByLabel(root, text, ["shares", "share", "dibagikan", "bagikan"]);
-    const mediaInfo = detectFacebookMediaInfo(root, url);
-
-    return {
-      platform: "facebook",
-      url,
-      shortcode: postId,
-      caption: extractFacebookCaption(root),
-      contentType: mediaInfo.contentType,
-      contentTypeLabel: mediaInfo.contentTypeLabel,
-      mediaCount: mediaInfo.mediaCount,
-      imageCount: mediaInfo.imageCount,
-      videoCount: mediaInfo.videoCount,
-      likeCount: reactionInfo.value,
-      commentCount: commentInfo.value,
-      shareCount: shareInfo.value,
-      savedCount: null,
-      postedAt: extractFacebookDate(root),
-      isPinned: Boolean(linkContext.isPinned),
-      isTopGridCandidate: isProfilePage("facebook") && linkContext.gridIndex >= 0 && linkContext.gridIndex < 3,
-      gridIndex: linkContext.gridIndex ?? null,
-      rawLikeText: reactionInfo.raw,
-      rawCommentText: commentInfo.raw,
-      rawShareText: shareInfo.raw,
-      rawSavedText: "",
-      scrapedAt: new Date().toISOString()
-    };
-  }
-
-  function extractFacebookCardData(link, postUrl, linkContext = {}) {
-    const root = getFacebookPostCardRoot(link);
-    const text = normalizeText(root.innerText || root.textContent || "");
-    const reactionInfo = extractFacebookReactionCount(root, text);
-    const commentInfo = extractFacebookCommentCount(root, text);
-    const shareInfo = extractFacebookCountByLabel(root, text, ["shares", "share", "dibagikan", "bagikan"]);
+  function extractFacebookCardData(linkOrRoot, postUrl, linkContext = {}, preserved = {}) {
+    const root = getFacebookPostCardRoot(linkOrRoot);
+    const metricText = extractFacebookMetricText(root);
+    const reactionInfo = extractFacebookReactionCount(root, metricText);
+    const commentInfo = extractFacebookCommentCount(root, metricText);
+    const shareInfo = extractFacebookCountByLabel(root, metricText, ["shares", "share", "dibagikan", "bagikan"]);
     const mediaInfo = detectFacebookMediaInfo(root, postUrl);
+    const rawDateText = preserved.rawDateText || extractFacebookRawDateText(root);
+    const postedAt = preserved.postedAt || extractFacebookDate(root);
 
     return {
       platform: "facebook",
@@ -604,9 +928,10 @@
       commentCount: commentInfo.value,
       shareCount: shareInfo.value,
       savedCount: null,
-      postedAt: extractFacebookDate(root),
+      postedAt,
+      rawDateText,
       isPinned: Boolean(linkContext.isPinned),
-      isTopGridCandidate: isProfilePage("facebook") && linkContext.gridIndex >= 0 && linkContext.gridIndex < 3,
+      isTopGridCandidate: false,
       gridIndex: linkContext.gridIndex ?? null,
       rawLikeText: reactionInfo.raw,
       rawCommentText: commentInfo.raw,
@@ -632,6 +957,7 @@
       commentCount: detailData.commentCount ?? cardData.commentCount,
       shareCount: detailData.shareCount ?? cardData.shareCount,
       postedAt: detailData.postedAt || cardData.postedAt,
+      rawDateText: detailData.rawDateText || cardData.rawDateText,
       rawLikeText: detailData.rawLikeText || cardData.rawLikeText,
       rawCommentText: detailData.rawCommentText || cardData.rawCommentText,
       rawShareText: detailData.rawShareText || cardData.rawShareText
@@ -715,10 +1041,10 @@
       const matchingArticle = articles.find((article) => {
         return [...article.querySelectorAll("a[href]")].some((link) => getPostId("facebook", link.href) === postId);
       });
-      if (matchingArticle) return matchingArticle;
+      if (matchingArticle) return normalizeFacebookPostRoot(matchingArticle);
     }
 
-    return articles.find((article) => extractFacebookDate(article) || extractFacebookCaption(article))
+    return normalizeFacebookPostRoot(articles.find((article) => extractFacebookDate(article) || extractFacebookCaption(article)))
       || document.querySelector("main")
       || document.body
       || null;
@@ -727,9 +1053,11 @@
   function getFacebookPostCardRoot(link) {
     if (link.matches?.('[role="article"], article, div[data-pagelet^="FeedUnit"]')) return link;
 
-    return link.closest('[role="article"], article, div[data-pagelet^="FeedUnit"]')
-      || climbToTextBlock(link, 8)
-      || link;
+    return normalizeFacebookPostRoot(
+      link.closest('[role="article"], article, div[data-pagelet^="FeedUnit"]')
+      || findFacebookPostRootFromNode(link)
+      || link
+    );
   }
 
   function isLikelyFacebookPostRoot(root) {
@@ -747,6 +1075,15 @@
     return (hasDate || hasCaption) && (hasPostAction || hasMedia);
   }
 
+  function isVisibleFacebookFeedRoot(root) {
+    const rect = root.getBoundingClientRect?.();
+    if (!rect) return false;
+    if (rect.width < 320 || rect.height < 120) return false;
+
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    return rect.bottom >= -150 && rect.top <= viewportHeight + 250;
+  }
+
   function findBestFacebookPostLink(root) {
     const links = [...root.querySelectorAll("a[href]")]
       .filter((link) => getPostId("facebook", cleanPostUrl("facebook", link.href)));
@@ -761,13 +1098,17 @@
   function scoreFacebookPostLink(link) {
     const href = link.href || "";
     const text = normalizeText(`${link.innerText || link.textContent || ""} ${link.getAttribute("aria-label") || ""} ${link.getAttribute("title") || ""}`);
+    const token = extractFacebookDateToken(text);
     let score = 0;
 
     if (/\/posts\/|\/permalink\/|permalink\.php|story_fbid=/i.test(href)) score += 120;
-    if (extractFacebookDateToken(text)) score += 110;
+    if (token && isStrongFacebookDateCandidateText(text, token)) score += 110;
     if (/\/videos\/|\/watch\/|\/reel\//i.test(href) || /[?&]v=/i.test(href)) score += 70;
     if (/\/photo\/|photo\.php/i.test(href)) score -= 45;
     if (/\b(like|comment|share|suka|komentar|bagikan|lihat semua foto|see all photos)\b/i.test(text)) score -= 60;
+    if (text.length > 96) score -= 180;
+    if (text.length > 48 && !token) score -= 90;
+    if (/\b(?:website|facebook|twitter|youtube|tiktok|selengkapnya|tampilkan lebih sedikit)\b/i.test(text)) score -= 120;
 
     const root = link.closest('[role="article"], article, div[data-pagelet^="FeedUnit"]');
     if (root && root.querySelector('[data-ad-preview="message"], [data-ad-comet-preview="message"]')) score += 20;
@@ -786,33 +1127,124 @@
     return current;
   }
 
-  function extractFacebookCaption(root) {
-    const directSelectors = [
-      '[data-ad-preview="message"]',
-      '[data-ad-comet-preview="message"]',
-      '[data-testid="post_message"]',
-      '[data-testid="post_message"] span'
-    ];
-    const direct = collectTextsFromSelectors(directSelectors, root)
-      .map(cleanFacebookCaptionLine)
-      .find(isPossibleFacebookCaption);
-    if (direct) return direct;
+  function findFacebookPostRootFromNode(node, maxDepth = 16) {
+    let current = node;
+    let best = null;
+    let bestScore = -Infinity;
 
-    return extractFacebookCaptionFromText(root.innerText || root.textContent || "");
-  }
+    for (let depth = 0; current && depth < maxDepth; depth += 1) {
+      const score = scoreFacebookPostRootCandidate(current, node, depth);
+      if (score > bestScore) {
+        bestScore = score;
+        best = current;
+      }
 
-  function extractFacebookCaptionFromText(text) {
-    const lines = splitCleanLines(text)
-      .map(cleanFacebookCaptionLine)
-      .filter(Boolean);
-    const dateIndex = lines.findIndex((line) => Boolean(extractFacebookDateToken(line)));
-    const startIndex = dateIndex >= 0 ? dateIndex + 1 : 0;
-
-    for (let index = startIndex; index < lines.length; index += 1) {
-      if (isPossibleFacebookCaption(lines[index])) return lines[index];
+      current = current.parentElement;
     }
 
-    return lines.find(isPossibleFacebookCaption) || "";
+    return best;
+  }
+
+  function getFacebookProfileSlug() {
+    try {
+      const path = new URL(window.location.href).pathname
+        .replace(/^\/+|\/+$/g, "")
+        .split("/")[0];
+      return normalizeText(path || "");
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function isLikelyFacebookPageAuthorName(text) {
+    const normalized = normalizeText(text).toLowerCase();
+    const slug = getFacebookProfileSlug().toLowerCase();
+    if (!normalized || !slug) return false;
+    if (normalized === slug) return true;
+    return normalized.replace(/\s+/g, "").includes(slug.replace(/\s+/g, ""));
+  }
+
+  function normalizeFacebookPostRoot(root, maxDepth = 12) {
+    if (!root?.parentElement) return root;
+    return findFacebookPostRootFromNode(root, maxDepth) || root;
+  }
+
+  function scoreFacebookPostRootCandidate(candidate, sourceNode, depth) {
+    if (!candidate?.querySelectorAll) return -Infinity;
+
+    const rect = candidate.getBoundingClientRect?.();
+    if (!rect || rect.width < 320 || rect.height < 140) return -Infinity;
+
+    const text = normalizeText(candidate.innerText || candidate.textContent || "");
+    if (text.length < 25) return -Infinity;
+
+    const linkCount = candidate.querySelectorAll("a[href]").length;
+    const mediaCount = candidate.querySelectorAll("img, video").length;
+    const hasCaption = Boolean(candidate.querySelector('[data-ad-preview="message"], [data-ad-comet-preview="message"], [data-testid="post_message"]'));
+    const hasPostAction = /\b(like|comment|share|suka|komentar|bagikan)\b/i.test(text);
+    const hasShareAction = /\b(share|bagikan)\b/i.test(text);
+    const hasReplyAction = /\b(reply|balas)\b/i.test(text);
+    const hasEditedCommentText = /\b(diedit|edited)\b/i.test(text);
+    const hasTimestampishLink = hasFacebookTimestampishLink(candidate);
+    const sourceContained = candidate.contains(sourceNode);
+    const isStructuredRoot = candidate.matches?.('[role="article"], article, div[data-pagelet^="FeedUnit"]');
+    const headerBand = getFacebookHeaderBand(candidate);
+    const authorNode = findFacebookAuthorNode(candidate, headerBand);
+    const authorText = normalizeText(authorNode?.innerText || authorNode?.textContent || "");
+    const matchesPageAuthor = isLikelyFacebookPageAuthorName(authorText);
+    const overLarge = rect.height > window.innerHeight * 2.8 || linkCount > 80;
+
+    let score = 0;
+    if (!sourceContained) score -= 500;
+    if (isStructuredRoot) score += 110;
+    if (authorNode) score += 90;
+    if (matchesPageAuthor) score += 180;
+    if (authorNode && !matchesPageAuthor) score -= 120;
+    if (hasCaption) score += 100;
+    if (mediaCount > 0) score += 50;
+    if (hasPostAction) score += 90;
+    if (hasShareAction) score += 80;
+    if (hasTimestampishLink) score += 140;
+    if (linkCount >= 3) score += 20;
+    if (rect.height >= 220) score += 20;
+    if (rect.height >= 380) score += 25;
+    if (rect.height >= 520) score += 20;
+    if (hasReplyAction && !hasShareAction) score -= 220;
+    if (hasEditedCommentText && !hasShareAction) score -= 90;
+    if (overLarge) score -= 180;
+    score -= depth * 6;
+
+    return score;
+  }
+
+  function hasFacebookTimestampishLink(root) {
+    const rootRect = root.getBoundingClientRect?.();
+    if (!rootRect) return false;
+
+    const bandBottom = rootRect.top + Math.max(120, Math.min(220, rootRect.height * 0.24));
+    return [...root.querySelectorAll('a[href][role="link"], a[href]')].some((link) => {
+      const rect = link.getBoundingClientRect?.();
+      if (!rect || rect.top < rootRect.top - 6 || rect.bottom > bandBottom + 24) return false;
+      if (link.querySelector("img, video")) return false;
+
+      const href = cleanPostUrl("facebook", link.href || "");
+      const text = normalizeText(`${link.innerText || link.textContent || ""} ${link.getAttribute("aria-label") || ""} ${link.getAttribute("title") || ""}`);
+      if (!getPostId("facebook", href)) return false;
+      return Boolean(extractFacebookDateToken(text) || parseFacebookDate(text));
+    });
+  }
+
+  function extractFacebookCaption(root) {
+    const captionContainer = findFacebookCaptionContainer(root);
+    if (captionContainer) {
+      const caption = normalizeText(captionContainer.innerText || captionContainer.textContent || "");
+      if (isPossibleFacebookCaption(caption)) return caption;
+    }
+    return "";
+  }
+
+  function findFacebookCaptionContainer(root) {
+    return collectFacebookCaptionCandidates(root)[0]?.node || null;
   }
 
   function cleanFacebookCaptionLine(line) {
@@ -827,35 +1259,692 @@
     if (/^(like|comment|share|suka|komentar|bagikan|follow|ikuti|send message|kirim pesan)$/i.test(text)) return false;
     if (/^\d+([.,]\d+)?\s*(k|m|rb|ribu|jt|juta)?$/i.test(text)) return false;
     if (/^\d+\s*(comments?|komentar|shares?|dibagikan)$/i.test(text)) return false;
+    if (/^(most relevant|semua komentar|most relevant is selected|relevan|relevant)$/i.test(text)) return false;
     if (/^all reactions?:/i.test(text)) return false;
     if (/^sponsored|bersponsor$/i.test(text)) return false;
     return true;
   }
 
   function extractFacebookDate(root) {
-    const candidates = [];
-    collectTextsFromSelectors([
-      "abbr",
-      "a[aria-label]",
-      "span[aria-label]",
-      'a[href*="/posts/"]',
-      'a[href*="story_fbid="]',
-      'a[href*="permalink.php"]'
-    ], root).forEach((text) => candidates.push(text));
-
-    splitCleanLines(root.innerText || root.textContent || "").forEach((line) => candidates.push(line));
-
-    for (const candidate of candidates) {
-      const token = extractFacebookDateToken(candidate);
-      const parsed = parseFacebookDate(token || candidate);
+    const rawDateText = extractFacebookRawDateText(root);
+    if (rawDateText) {
+      const token = extractFacebookDateToken(rawDateText);
+      const parsed = parseFacebookDate(rawDateText) || (token ? parseFacebookDate(token) : "");
       if (parsed) return parsed;
     }
 
     return "";
   }
 
+  function extractReliableFacebookLinkDateText(root) {
+    const postLink = findBestFacebookPostLink(root);
+    if (!postLink) return "";
+
+    const labels = [
+      normalizeText(postLink.getAttribute?.("aria-label") || ""),
+      normalizeText(postLink.querySelector?.("[aria-label]")?.getAttribute?.("aria-label") || ""),
+      collectFacebookAriaReferenceText(postLink),
+      normalizeText(postLink.getAttribute?.("title") || "")
+    ].filter(Boolean);
+
+    for (const label of labels) {
+      if (/\b(suka|komentar|bagikan|like|comment|share|beri komentar|beri reaksi)\b/i.test(label)) continue;
+      if (/\b(?:website|facebook|twitter|youtube|tiktok|selengkapnya|tampilkan lebih sedikit)\b/i.test(label)) continue;
+
+      const token = extractFacebookDateToken(label);
+      if (!token || !isStrongFacebookDateCandidateText(label, token)) continue;
+      if (label.length > Math.max(token.length + 24, 48)) continue;
+
+      return normalizeFacebookHeaderDateText(label);
+    }
+
+    return "";
+  }
+
+  function extractFacebookRawDateText(root) {
+    const headerCandidate = collectFacebookHeaderDateCandidates(root)[0];
+    if (headerCandidate?.text) return headerCandidate.text;
+
+    const linkDateText = extractReliableFacebookLinkDateText(root);
+    if (linkDateText) return linkDateText;
+
+    return "";
+  }
+
+  function findFacebookTimestampLink(root) {
+    return collectFacebookHeaderDateCandidates(root).find((item) => item.kind === "link")?.node || null;
+  }
+
+  function scoreFacebookTimestampLink(link, root, authorNode = null) {
+    const combined = collectFacebookHeaderDateText(link, authorNode);
+    const token = extractFacebookDateToken(combined);
+    const href = cleanPostUrl("facebook", link.href || "");
+    const hasDateEvidence = Boolean(token);
+    const authorHref = cleanPostUrl("facebook", authorNode?.href || authorNode?.closest?.("a[href]")?.href || "");
+    const sameProfileAsAuthor = Boolean(authorHref && getComparableFacebookUrl(href) === getComparableFacebookUrl(authorHref));
+    let score = 0;
+
+    if (!href || !hasDateEvidence) return 0;
+    if (!isStrongFacebookDateCandidateText(combined, token)) return 0;
+    if (sameProfileAsAuthor && !isAbsoluteFacebookDateToken(token) && !/\/posts\/|\/permalink\/|permalink\.php|story_fbid=|\/videos\/|\/watch\/|\/reel\/|\/photo\//i.test(link.href || "")) return 0;
+    if (/\/posts\/|\/permalink\/|permalink\.php|story_fbid=|\/videos\/|\/watch\/|\/reel\//i.test(href)) score += 90;
+    if (token) score += 150;
+    if (/^(just now|baru saja|\d+\s*(m|min|menit|h|jam|d|hari|w|minggu|mo|bulan|y|tahun))$/i.test(combined)) score += 60;
+    if (/^(like|comment|share|suka|komentar|bagikan)$/i.test(combined)) score -= 120;
+    if (/\/photo\/|photo\.php/i.test(href)) score -= 220;
+    if (/\/media\/set/i.test(href)) score -= 220;
+    if (/tampilkan lebih sedikit|lihat selengkapnya|website\s*:|twitter\s*:|youtube\s*:|tiktok\s*:/i.test(combined)) score -= 260;
+
+    const rootRect = root?.getBoundingClientRect?.();
+    const linkRect = link.getBoundingClientRect?.();
+    if (rootRect && linkRect && rootRect.height > 0) {
+      const verticalRatio = (linkRect.top - rootRect.top) / Math.max(rootRect.height, 1);
+      if (verticalRatio <= 0.2) score += 120;
+      else if (verticalRatio <= 0.28) score += 40;
+      else score -= 220;
+    }
+
+    if (authorNode?.compareDocumentPosition) {
+      const relation = authorNode.compareDocumentPosition(link);
+      if (relation & Node.DOCUMENT_POSITION_FOLLOWING) score += 90;
+      if (relation & Node.DOCUMENT_POSITION_PRECEDING) score -= 140;
+    }
+
+    return score;
+  }
+
+  function getFacebookHeaderBand(root) {
+    const rect = root.getBoundingClientRect();
+    const messageContainer = getFacebookMessageContainer(root);
+    const messageRect = messageContainer?.getBoundingClientRect?.() || null;
+    const mediaRect = root.querySelector("img, video")?.getBoundingClientRect?.() || null;
+    const actionRect = findFacebookActionBarRoot(root)?.getBoundingClientRect?.() || null;
+
+    const boundaryCandidates = [
+      messageRect?.top ? messageRect.top - 14 : null,
+      mediaRect?.top ? mediaRect.top - 14 : null,
+      actionRect?.top ? actionRect.top - 18 : null
+    ]
+      .filter((value) => Number.isFinite(value))
+      .filter((value) => value > rect.top + 40);
+
+    const defaultBottom = rect.top + Math.max(170, Math.min(360, rect.height * 0.4));
+    const derivedBottom = boundaryCandidates.length ? Math.min(...boundaryCandidates) : defaultBottom;
+
+    return {
+      top: rect.top,
+      bottom: Math.max(rect.top + 96, Math.min(defaultBottom, derivedBottom))
+    };
+  }
+
+  function isNodeInsideFacebookHeaderBand(node, band) {
+    const rect = node.getBoundingClientRect?.();
+    if (!rect || !band) return false;
+    return rect.top >= band.top - 10 && rect.bottom <= band.bottom + 28;
+  }
+
+  function getFacebookMessageContainer(root) {
+    return root.querySelector(
+      '[data-ad-preview="message"], [data-ad-comet-preview="message"], [data-testid="post_message"]'
+    );
+  }
+
+  function findFacebookActionBarRoot(root) {
+    return [...root.querySelectorAll('div, section, footer')]
+      .find((node) => {
+        const text = normalizeText(node.innerText || node.textContent || "");
+        if (!text) return false;
+        if (!/\b(suka|komentar|bagikan|like|comment|share)\b/i.test(text)) return false;
+        const rect = node.getBoundingClientRect?.();
+        return Boolean(rect && rect.height >= 24 && rect.width >= 180);
+      }) || null;
+  }
+
+  function findFacebookAuthorNode(root, headerBand) {
+    const selectors = [
+      'h2 a[role="link"]',
+      'h3 a[role="link"]',
+      'strong a[role="link"]',
+      'a[role="link"] strong',
+      'a[role="link"] span',
+      'a[role="link"]'
+    ];
+    const candidates = [...root.querySelectorAll(selectors.join(", "))]
+      .filter((node) => {
+        if (!isNodeInsideFacebookHeaderBand(node, headerBand)) return false;
+        const text = normalizeText(node.innerText || node.textContent || "");
+        if (!text || text.length < 2) return false;
+        if (extractFacebookDateToken(text)) return false;
+        if (/^(like|comment|share|suka|komentar|bagikan|follow|ikuti)$/i.test(text)) return false;
+        return !node.querySelector("img, video");
+      })
+      .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+    return candidates[0] || null;
+  }
+
+  function collectFacebookDirectDateText(node, authorNode = null) {
+    const authorText = normalizeText(authorNode?.innerText || authorNode?.textContent || "");
+    const exactSources = [
+      collectFacebookTopRowLeafText(node),
+      collectFacebookAriaReferenceText(node),
+      collectFacebookCollapsedLeafText(node),
+      normalizeText(node.getAttribute?.("aria-label") || ""),
+      normalizeText(node.getAttribute?.("aria-description") || ""),
+      normalizeText(node.getAttribute?.("title") || ""),
+      normalizeText(node.getAttribute?.("data-tooltip-content") || ""),
+      normalizeText(node.getAttribute?.("datetime") || ""),
+      normalizeText(node.getAttribute?.("data-utime") || ""),
+      normalizeText(node.innerText || node.textContent || "")
+    ];
+
+    const normalizedSources = [...new Set(exactSources
+      .map((value) => sanitizeFacebookHeaderDateText(value, authorText))
+      .filter(Boolean))];
+
+    for (const source of normalizedSources) {
+      if (isStrongFacebookDateCandidateText(source)) return source;
+    }
+
+    return normalizedSources.find((source) => !isFragmentedFacebookHeaderText(source)) || "";
+  }
+
+  function collectFacebookTopRowLeafText(node) {
+    const topRowText = normalizeFacebookHeaderDateText(collectFacebookTopRowLeafRawText(node));
+
+    const token = extractFacebookDateToken(topRowText);
+    if (token && isStrongFacebookDateCandidateText(topRowText, token)) {
+      return topRowText;
+    }
+
+    return "";
+  }
+
+  function collectFacebookTopRowLeafRawText(node) {
+    if (!node?.querySelectorAll) return "";
+
+    const leafNodes = [...node.querySelectorAll("span, a, abbr, time, div")]
+      .filter((child) => child.children.length === 0)
+      .map((child) => {
+        const rect = child.getBoundingClientRect?.();
+        if (!rect || rect.height <= 0 || rect.width <= 0) return null;
+
+        return {
+          rawText: String(child.textContent || "").replace(/\u00a0/g, " "),
+          top: rect.top,
+          left: rect.left
+        };
+      })
+      .filter((item) => item && item.rawText.length);
+
+    if (!leafNodes.length) return "";
+
+    const topRowTop = Math.min(...leafNodes.map((item) => item.top));
+    return leafNodes
+      .filter((item) => Math.abs(item.top - topRowTop) <= 2)
+      .sort((a, b) => a.left - b.left)
+      .map((item) => item.rawText)
+      .join("");
+  }
+
+  function collectFacebookTopRowMetricText(node) {
+    const rawTopRow = collectFacebookTopRowLeafRawText(node);
+    if (!rawTopRow) return "";
+
+    const compact = normalizeText(rawTopRow).replace(/\s+/g, "");
+    if (/^\d+(?:[.,]\d+)?(?:k|m|b|rb|ribu|jt|juta|million|thousand|billion)?$/i.test(compact)) {
+      return compact;
+    }
+
+    const normalized = normalizeText(rawTopRow);
+    const matchedNumber = normalized.match(/\b\d+(?:[.,]\d+)?\s*(?:k|m|b|rb|ribu|jt|juta|million|thousand|billion)?\b/i);
+    return matchedNumber?.[0] ? normalizeText(matchedNumber[0]) : "";
+  }
+
+  function collectFacebookCollapsedLeafText(node) {
+    if (!node?.querySelectorAll) return "";
+
+    const topRowText = collectFacebookTopRowLeafText(node);
+    if (topRowText) return topRowText;
+
+    const leafTexts = [...node.querySelectorAll("span, a, abbr, time, div")]
+      .filter((child) => child.children.length === 0)
+      .map((child) => child.textContent || "")
+      .map((text) => String(text).replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+
+    if (!leafTexts.length) return "";
+
+    const mostlySingleChar = leafTexts.filter((text) => text.length === 1).length >= Math.max(4, Math.floor(leafTexts.length * 0.5));
+    if (!mostlySingleChar) return "";
+
+    return normalizeFacebookHeaderDateText(leafTexts.join(""));
+  }
+
+  function collectFacebookAuthorAdjacentNodes(authorNode, root) {
+    if (!authorNode || !root) return [];
+
+    const candidates = [];
+    const seen = new Set();
+    let current = authorNode;
+
+    for (let depth = 0; current && current !== root && depth < 5; depth += 1) {
+      const parent = current.parentElement;
+      if (!parent) break;
+
+      if (!seen.has(parent)) {
+        seen.add(parent);
+        candidates.push(parent);
+      }
+
+      let sibling = current.nextElementSibling;
+      while (sibling) {
+        if (!seen.has(sibling)) {
+          seen.add(sibling);
+          candidates.push(sibling);
+        }
+        sibling = sibling.nextElementSibling;
+      }
+
+      current = parent;
+    }
+
+    return candidates;
+  }
+
+  function collectFacebookAuthorAdjacentDateCandidates(root, authorNode = null) {
+    if (!authorNode) return [];
+
+    return collectFacebookAuthorAdjacentNodes(authorNode, root)
+      .flatMap((container) => {
+        const nodes = [container];
+        nodes.push(...container.querySelectorAll?.('a[href], span, div, abbr, time, [aria-labelledby], [aria-label], [title], [data-tooltip-content], [data-utime]') || []);
+        return nodes;
+      })
+      .filter((node, index, array) => node && array.indexOf(node) === index)
+      .map((node) => {
+        const text = collectFacebookDirectDateText(node, authorNode);
+        const token = extractFacebookDateToken(text);
+        if (!token || !isStrongFacebookDateCandidateText(text, token)) return null;
+
+        const nodeRect = node.getBoundingClientRect?.();
+        const authorRect = authorNode.getBoundingClientRect?.();
+        const verticalGap = nodeRect && authorRect ? Math.abs(nodeRect.top - authorRect.bottom) : 0;
+        const horizontalGap = nodeRect && authorRect ? Math.abs(nodeRect.left - authorRect.left) : 0;
+        let score = 0;
+
+        score += 420;
+        score -= Math.min(160, verticalGap * 2);
+        score -= Math.min(120, horizontalGap);
+        if (node.tagName?.toLowerCase() === "a") score += 40;
+        if (isAbsoluteFacebookDateToken(token)) score += 30;
+
+        return {
+          node,
+          kind: node.tagName?.toLowerCase() === "a" ? "link" : "text",
+          text,
+          score
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+  }
+
+  function collectFacebookAuthorAriaLabelledDateCandidates(root, authorNode = null) {
+    if (!authorNode) return [];
+
+    const messageContainer = getFacebookMessageContainer(root);
+    return [...root.querySelectorAll('[aria-labelledby], [aria-describedby]')]
+      .filter((node) => {
+        if (messageContainer?.contains(node) && node !== messageContainer) return false;
+        if (node.querySelector?.("img, video")) return false;
+        if (!isNodeJustBelowFacebookAuthor(node, authorNode, root)) return false;
+
+        const rect = node.getBoundingClientRect?.();
+        if (!rect || rect.width > 220 || rect.height > 32) return false;
+        return true;
+      })
+      .map((node) => {
+        const text = collectFacebookDirectDateText(node, authorNode) || collectFacebookAriaReferenceText(node);
+        const token = extractFacebookDateToken(text);
+        const nodeRect = node.getBoundingClientRect?.();
+        const authorRect = authorNode.getBoundingClientRect?.();
+        const verticalGap = nodeRect && authorRect ? Math.max(0, nodeRect.top - authorRect.bottom) : 0;
+        const horizontalGap = nodeRect && authorRect ? Math.abs(nodeRect.left - authorRect.left) : 0;
+        let score = 0;
+
+        if (!token || !isStrongFacebookDateCandidateText(text, token)) return null;
+
+        score += 560;
+        score -= Math.min(120, verticalGap * 4);
+        score -= Math.min(100, horizontalGap);
+        if (node.hasAttribute?.("aria-labelledby")) score += 80;
+        if (node.hasAttribute?.("aria-describedby")) score += 40;
+        if (isAbsoluteFacebookDateToken(token)) score += 30;
+
+        return {
+          node,
+          kind: "text",
+          text,
+          score
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+  }
+
+  function isNodeJustBelowFacebookAuthor(node, authorNode, root = null) {
+    const nodeRect = node?.getBoundingClientRect?.();
+    const authorRect = authorNode?.getBoundingClientRect?.();
+    const rootRect = root?.getBoundingClientRect?.();
+    if (!nodeRect || !authorRect) return false;
+    if (node === authorNode) return false;
+    if (node.contains?.(authorNode) || authorNode.contains?.(node)) return false;
+
+    const relation = authorNode.compareDocumentPosition?.(node) || 0;
+    if (!(relation & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+
+    const maxBottom = Math.min(rootRect?.bottom ?? Number.POSITIVE_INFINITY, authorRect.bottom + 120);
+    const verticalGap = nodeRect.top - authorRect.bottom;
+    const horizontalGap = Math.abs(nodeRect.left - authorRect.left);
+
+    if (verticalGap < -10 || nodeRect.bottom > maxBottom + 16) return false;
+    if (horizontalGap > 220) return false;
+    if (nodeRect.width > 260) return false;
+
+    return true;
+  }
+
+  function collectFacebookAuthorContextDateCandidates(root, authorNode = null) {
+    if (!authorNode) return [];
+
+    const messageContainer = getFacebookMessageContainer(root);
+    return [...root.querySelectorAll('a[href], span, div, abbr, time, [aria-labelledby], [aria-label], [title], [data-tooltip-content], [data-utime]')]
+      .filter((node) => {
+        if (messageContainer?.contains(node)) return false;
+        if (node.querySelector?.("img, video")) return false;
+        return isNodeJustBelowFacebookAuthor(node, authorNode, root);
+      })
+      .map((node) => {
+        const text = collectFacebookDirectDateText(node, authorNode);
+        const token = extractFacebookDateToken(text);
+        const rect = node.getBoundingClientRect?.();
+        const authorRect = authorNode.getBoundingClientRect?.();
+        const verticalGap = rect && authorRect ? Math.max(0, rect.top - authorRect.bottom) : 0;
+        const horizontalGap = rect && authorRect ? Math.abs(rect.left - authorRect.left) : 0;
+        let score = 0;
+
+        if (!token || !isStrongFacebookDateCandidateText(text, token)) return null;
+
+        score += 340;
+        score -= Math.min(120, verticalGap * 3);
+        score -= Math.min(120, horizontalGap);
+        if (node.tagName?.toLowerCase() === "a") score += 30;
+        if (isAbsoluteFacebookDateToken(token)) score += 20;
+
+        return {
+          node,
+          kind: node.tagName?.toLowerCase() === "a" ? "link" : "text",
+          text,
+          score
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+  }
+
+  function collectFacebookAriaReferenceText(node) {
+    const doc = node?.ownerDocument;
+    if (!doc?.getElementById) return "";
+
+    const referenceIds = normalizeText([
+      node.getAttribute?.("aria-labelledby") || "",
+      node.getAttribute?.("aria-describedby") || ""
+    ].join(" "))
+      .split(/\s+/)
+      .filter(Boolean);
+
+    if (!referenceIds.length) return "";
+
+    const texts = referenceIds
+      .map((id) => doc.getElementById(id))
+      .filter(Boolean)
+      .map((target) => normalizeText([
+        target.innerText || target.textContent || "",
+        target.getAttribute?.("aria-label") || "",
+        target.getAttribute?.("aria-description") || "",
+        target.getAttribute?.("title") || ""
+      ].join(" ")))
+      .filter(Boolean);
+
+    return normalizeText(texts.join(" "));
+  }
+
+  function sanitizeFacebookHeaderDateText(text, authorText = "") {
+    if (!text) return "";
+    const sanitized = authorText
+      ? text.replace(new RegExp(authorText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "ig"), " ")
+      : text;
+    return normalizeFacebookHeaderDateText(sanitized);
+  }
+
+  function isFragmentedFacebookHeaderText(text) {
+    const normalized = normalizeText(text);
+    if (!normalized) return false;
+
+    const tokens = normalized.split(/\s+/).filter(Boolean);
+    if (tokens.length < 8) return false;
+
+    const singleLetters = tokens.filter((token) => /^[a-z]$/i.test(token)).length;
+    const singleDigits = tokens.filter((token) => /^\d$/.test(token)).length;
+    const longTokens = tokens.filter((token) => token.length >= 3).length;
+    const fragmentedRatio = (singleLetters + singleDigits) / Math.max(tokens.length, 1);
+
+    return (singleLetters >= 5 && singleLetters / Math.max(tokens.length, 1) >= 0.35)
+      || (fragmentedRatio >= 0.7 && longTokens <= 2);
+  }
+
+  function isAbsoluteFacebookDateToken(token) {
+    if (!token) return false;
+    return /\b(?:20\d{2}[./-]\d{1,2}[./-]\d{1,2}|\d{1,2}[./-]\d{1,2}[./-]20\d{2})\b/i.test(token)
+      || /\b\d{1,2}\s+(?:jan(?:uary|uari)?|feb(?:ruary|ruari)?|mar(?:ch|et)?|apr(?:il)?|mei|may|jun(?:e|i)?|jul(?:y|i)?|aug(?:ust)?|agu(?:stus)?|sep(?:t|tember)?|okt(?:ober)?|oct(?:ober)?|nov(?:ember)?|des(?:ember)?|dec(?:ember)?)(?:\s+20\d{2})?\b/i.test(token)
+      || /\b(?:jan(?:uary|uari)?|feb(?:ruary|ruari)?|mar(?:ch|et)?|apr(?:il)?|mei|may|jun(?:e|i)?|jul(?:y|i)?|aug(?:ust)?|agu(?:stus)?|sep(?:t|tember)?|okt(?:ober)?|oct(?:ober)?|nov(?:ember)?|des(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:,?\s+20\d{2})?\b/i.test(token);
+  }
+
+  function isRelativeFacebookDateToken(token) {
+    if (!token) return false;
+    return /^\d+\s*(?:minutes?|minute|menit|hours?|hour|hari|days?|day|weeks?|week|minggu|months?|month|bulan|years?|year|tahun|min|hr|jam|mo|yr)\b(?:\s*(?:ago|lalu))?$/i.test(token)
+      || /^\d+\s*[mhdwy]$/i.test(token)
+      || /^(?:yesterday|kemarin|just now|baru saja)$/i.test(token);
+  }
+
+  function hasCompactFacebookDateContext(text, token) {
+    const normalized = normalizeFacebookHeaderDateText(normalizeText(text));
+    if (!normalized || !token) return false;
+
+    const escapedToken = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const remainder = normalizeText(normalized
+      .replace(new RegExp(escapedToken, "i"), " ")
+      .replace(/\b(?:pada|at|pukul|ago|lalu|edited|edit|diedit|updated|diupdate)\b/gi, " ")
+      .replace(/\b(?:senin|selasa|rabu|kamis|jumat|sabtu|minggu|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, " ")
+      .replace(/\b\d{1,2}[:.]\d{2}(?:\s*(?:am|pm))?\b/gi, " ")
+      .replace(/[|·,:()\-]/g, " "));
+
+    if (!remainder) return true;
+
+    const words = remainder.split(/\s+/).filter(Boolean);
+    return words.length <= 1 && words.every((word) => /^[0-9apm.]+$/i.test(word));
+  }
+
+  function isStrongFacebookDateCandidateText(text, token = extractFacebookDateToken(text)) {
+    const normalized = normalizeFacebookHeaderDateText(normalizeText(text));
+    if (!normalized || !token || isFragmentedFacebookHeaderText(normalized)) return false;
+    if (isAbsoluteFacebookDateToken(token)) {
+      if (normalized.length > Math.max(token.length + 24, 42)) return false;
+      return hasCompactFacebookDateContext(normalized, token);
+    }
+
+    if (isRelativeFacebookDateToken(token)) {
+      return normalized === token
+        || normalized === `${token} ago`
+        || normalized === `${token} lalu`
+        || normalized.length <= token.length + 4;
+    }
+
+    return false;
+  }
+
+  function getComparableFacebookUrl(url) {
+    if (!url) return "";
+    try {
+      const parsed = new URL(url, window.location.href);
+      return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`.toLowerCase();
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function collectFacebookHeaderDateText(node, authorNode = null) {
+    const directText = collectFacebookDirectDateText(node, authorNode);
+    if (isStrongFacebookDateCandidateText(directText)) return directText;
+
+    const authorText = normalizeText(authorNode?.innerText || authorNode?.textContent || "");
+    const parentText = normalizeText(node.parentElement?.innerText || node.parentElement?.textContent || "");
+    const localParentText = parentText.length <= 80 ? parentText : "";
+    const sources = [...new Set([
+      directText,
+      localParentText
+    ]
+      .map((value) => sanitizeFacebookHeaderDateText(value, authorText))
+      .filter(Boolean))];
+
+    const best = sources
+      .map((text) => ({
+        text,
+        strong: isStrongFacebookDateCandidateText(text),
+        absolute: isAbsoluteFacebookDateToken(extractFacebookDateToken(text)),
+        short: text.length <= 40
+      }))
+      .filter((item) => !isFragmentedFacebookHeaderText(item.text))
+      .sort((a, b) => {
+        if (a.strong !== b.strong) return a.strong ? -1 : 1;
+        if (a.absolute !== b.absolute) return a.absolute ? -1 : 1;
+        if (a.short !== b.short) return a.short ? -1 : 1;
+        return a.text.length - b.text.length;
+      })[0];
+
+    return best?.text || "";
+  }
+
+  function collectFacebookHeaderDateCandidates(root) {
+    const headerBand = getFacebookHeaderBand(root);
+    const authorNode = findFacebookAuthorNode(root, headerBand);
+    const messageContainer = getFacebookMessageContainer(root);
+    const ariaLabelledCandidates = collectFacebookAuthorAriaLabelledDateCandidates(root, authorNode);
+    const adjacentCandidates = collectFacebookAuthorAdjacentDateCandidates(root, authorNode);
+    const directCandidates = collectFacebookAuthorContextDateCandidates(root, authorNode);
+    const nodes = [...root.querySelectorAll('a[href], span, div, abbr, time, [aria-labelledby], [aria-label], [title], [data-tooltip-content], [data-utime]')]
+      .filter((node) => {
+        if (!isNodeInsideFacebookHeaderBand(node, headerBand)) return false;
+        if (messageContainer?.contains(node) && node !== messageContainer) return false;
+        if (node.querySelector?.("img, video")) return false;
+        return true;
+      });
+
+    const headerCandidates = nodes
+      .map((node) => {
+        const text = collectFacebookHeaderDateText(node, authorNode);
+        return {
+          node,
+          kind: node.tagName?.toLowerCase() === "a" ? "link" : "text",
+          text,
+          score: node.tagName?.toLowerCase() === "a"
+            ? scoreFacebookTimestampLink(node, root, authorNode)
+            : scoreFacebookHeaderTextNode(node, text, root, authorNode)
+        };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    const seen = new Set();
+    return [...ariaLabelledCandidates, ...adjacentCandidates, ...directCandidates, ...headerCandidates]
+      .filter((item) => {
+        if (!item?.node || seen.has(item.node)) return false;
+        seen.add(item.node);
+        return true;
+      })
+      .sort((a, b) => b.score - a.score);
+  }
+
+  function scoreFacebookHeaderTextNode(node, combined, root, authorNode = null) {
+    if (!combined) return 0;
+    const token = extractFacebookDateToken(combined);
+    if (!token) return 0;
+    if (!isStrongFacebookDateCandidateText(combined, token)) return 0;
+    if (/tampilkan lebih sedikit|lihat selengkapnya|website\s*:|twitter\s*:|youtube\s*:|tiktok\s*:/i.test(combined)) return 0;
+    if (combined.length > 80) return 0;
+
+    let score = 120;
+    const rootRect = root?.getBoundingClientRect?.();
+    const rect = node.getBoundingClientRect?.();
+    if (rootRect && rect && rootRect.height > 0) {
+      const verticalRatio = (rect.top - rootRect.top) / Math.max(rootRect.height, 1);
+      if (verticalRatio <= 0.2) score += 80;
+      else if (verticalRatio > 0.28) score -= 200;
+    }
+
+    if (authorNode?.compareDocumentPosition) {
+      const relation = authorNode.compareDocumentPosition(node);
+      if (relation & Node.DOCUMENT_POSITION_FOLLOWING) score += 70;
+      if (relation & Node.DOCUMENT_POSITION_PRECEDING) score -= 120;
+    }
+
+    return score;
+  }
+
+  function collectFacebookCaptionCandidates(root, timestampLink = findFacebookTimestampLink(root)) {
+    const directContainer = root.querySelector(
+      '[data-ad-preview="message"], [data-ad-comet-preview="message"], [data-testid="post_message"]'
+    );
+    if (directContainer) {
+      return [{
+        node: directContainer,
+        followsTimestamp: Boolean(timestampLink && (timestampLink.compareDocumentPosition(directContainer) & Node.DOCUMENT_POSITION_FOLLOWING)),
+        depth: getNodeDepth(directContainer, root),
+        textLength: normalizeText(directContainer.innerText || directContainer.textContent || "").length
+      }];
+    }
+
+    if (!timestampLink) return [];
+
+    return [...root.querySelectorAll('div[dir="auto"], span[dir="auto"]')]
+      .filter((node) => {
+        if (!node.isConnected) return false;
+
+        const text = cleanFacebookCaptionLine(node.innerText || node.textContent || "");
+        if (!isPossibleFacebookCaption(text)) return false;
+
+        const actionScope = node.closest('form, footer, nav');
+        if (actionScope) return false;
+
+        return true;
+      })
+      .map((node) => ({
+        node,
+        followsTimestamp: Boolean(timestampLink.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING),
+        depth: getNodeDepth(node, root),
+        textLength: normalizeText(node.innerText || node.textContent || "").length
+      }))
+      .sort((a, b) => {
+        if (a.followsTimestamp !== b.followsTimestamp) return a.followsTimestamp ? -1 : 1;
+        if (a.depth !== b.depth) return a.depth - b.depth;
+        return b.textLength - a.textLength;
+      });
+  }
+
   function extractFacebookDateToken(text) {
     const normalized = normalizeText(text);
+    if (!normalized || isFragmentedFacebookHeaderText(normalized)) return "";
     const absoluteNumeric = normalized.match(/\b(?:20\d{2}[./-]\d{1,2}[./-]\d{1,2}|\d{1,2}[./-]\d{1,2}[./-]20\d{2})\b/);
     if (absoluteNumeric?.[0]) return absoluteNumeric[0];
 
@@ -866,24 +1955,56 @@
     const monthDay = normalized.match(new RegExp(`\\b${monthNamePattern}\\s+\\d{1,2}(?:,?\\s+20\\d{2})?\\b`, "i"));
     if (monthDay?.[0]) return monthDay[0];
 
-    const relative = normalized.match(/\b(\d+)\s*(m|min|minute|minutes|menit|h|hr|hour|hours|jam|d|day|days|hari|w|week|weeks|minggu|mo|month|months|bulan|y|yr|year|years|tahun)\s*(ago|lalu)?\b/i);
-    if (relative?.[0]) return relative[0];
+    const relativeWord = normalized.match(/\b(\d+)\s*(minutes?|minute|menit|hours?|hour|hari|days?|day|weeks?|week|minggu|months?|month|bulan|years?|year|tahun|min|hr|jam|mo|yr|detik|seconds?|second|sec)\b(?:\s*(ago|lalu))?/i);
+    if (relativeWord?.[0]) return relativeWord[0];
+
+    if (/^\d+\s*[mhdwy]$/i.test(normalized)) return normalized;
 
     if (/\b(yesterday|kemarin|just now|baru saja)\b/i.test(normalized)) return normalized;
     return "";
   }
 
+  function normalizeFacebookHeaderDateText(text) {
+    let normalized = normalizeText(text);
+    normalized = normalized.replace(/\byang lalu\b/gi, "lalu");
+    normalized = normalized.replace(/\b([0-9])\s*\.\s*([0-9]{2})\s*h\b/gi, "$1.$2 h");
+    normalized = normalized.replace(/\b([0-9])\s*([0-9])\s*h\b/gi, "$1$2h");
+    normalized = normalized.replace(/\b([0-9])\s*([0-9])\s*jam\b/gi, "$1$2 jam");
+    normalized = normalized.replace(/\b([0-9])\s*minggu\b/gi, "$1 minggu");
+    normalized = normalized.replace(/\b([0-9])\s*hari\b/gi, "$1 hari");
+    normalized = normalized.replace(/\b([0-9])\s*jam\b/gi, "$1 jam");
+    normalized = normalized.replace(/\b([0-9])\s*menit\b/gi, "$1 menit");
+    return normalized;
+  }
+
   function parseFacebookDate(value) {
     if (!value) return "";
-    const text = normalizeText(value).replace(/\bat\b|\bpukul\b/gi, " ");
+    const text = normalizeFacebookHeaderDateText(normalizeText(value)
+      .replace(/\b(?:senin|selasa|rabu|kamis|jumat|sabtu|minggu|monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s*/gi, "")
+      .replace(/\b(?:at|pukul)\b/gi, " "));
+    if (!text || isFragmentedFacebookHeaderText(text)) return "";
+    const timeMatch = text.match(/\b(\d{1,2})[:.](\d{2})(?:\s*(am|pm))?\b/i);
+    const timeInfo = timeMatch
+      ? {
+          hours: Number(timeMatch[1]),
+          minutes: Number(timeMatch[2]),
+          meridiem: (timeMatch[3] || "").toLowerCase()
+        }
+      : null;
 
     const numericToken = text.match(/\b(?:20\d{2}[./-]\d{1,2}[./-]\d{1,2}|\d{1,2}[./-]\d{1,2}[./-]20\d{2}|\d{1,2}[./-]\d{1,2})\b/);
     if (numericToken?.[0]) {
       const numeric = normalizeTikTokDate(numericToken[0]);
-      if (numeric) return numeric;
+      if (numeric) return applyTimeToIso(numeric, timeInfo);
     }
 
-    const relative = text.match(/\b(\d+)\s*(m|min|minute|minutes|menit|h|hr|hour|hours|jam|d|day|days|hari|w|week|weeks|minggu|mo|month|months|bulan|y|yr|year|years|tahun)\s*(ago|lalu)?\b/i);
+    if (/^\d{10,13}$/.test(text)) {
+      const timestampValue = Number(text.length === 10 ? `${text}000` : text);
+      const timestampDate = new Date(timestampValue);
+      return Number.isNaN(timestampDate.getTime()) ? "" : timestampDate.toISOString();
+    }
+
+    const relative = text.match(/^(\d+)\s*(minutes?|minute|menit|hours?|hour|hari|days?|day|weeks?|week|minggu|months?|month|bulan|years?|year|tahun|min|hr|jam|mo|yr|m|h|d|w|y)\b(?:\s*(ago|lalu))?$/i);
     if (relative) {
       const amount = Number(relative[1]);
       const unit = relative[2].toLowerCase();
@@ -926,30 +2047,29 @@
     }
     if (/\b(just now|baru saja)\b/i.test(text)) return new Date().toISOString();
 
-    const named = parseNamedMonthDate(text);
+    const named = parseNamedMonthDate(text, timeInfo);
     if (named) return named;
-
-    const parsed = new Date(text);
-    return Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString();
-  }
-
-  function parseNamedMonthDate(text) {
-    const monthNamePattern = "(jan(?:uary|uari)?|feb(?:ruary|ruari)?|mar(?:ch|et)?|apr(?:il)?|mei|may|jun(?:e|i)?|jul(?:y|i)?|aug(?:ust)?|agu(?:stus)?|sep(?:t|tember)?|okt(?:ober)?|oct(?:ober)?|nov(?:ember)?|des(?:ember)?|dec(?:ember)?)";
-    const dayMonth = text.match(new RegExp(`\\b(\\d{1,2})\\s+${monthNamePattern}(?:\\s+(20\\d{2}))?\\b`, "i"));
-    if (dayMonth) return buildInferredNamedDate(dayMonth[1], dayMonth[2], dayMonth[3]);
-
-    const monthDay = text.match(new RegExp(`\\b${monthNamePattern}\\s+(\\d{1,2})(?:,?\\s+(20\\d{2}))?\\b`, "i"));
-    if (monthDay) return buildInferredNamedDate(monthDay[2], monthDay[1], monthDay[3]);
 
     return "";
   }
 
-  function buildInferredNamedDate(day, monthName, year) {
+  function parseNamedMonthDate(text, timeInfo = null) {
+    const monthNamePattern = "(jan(?:uary|uari)?|feb(?:ruary|ruari)?|mar(?:ch|et)?|apr(?:il)?|mei|may|jun(?:e|i)?|jul(?:y|i)?|aug(?:ust)?|agu(?:stus)?|sep(?:t|tember)?|okt(?:ober)?|oct(?:ober)?|nov(?:ember)?|des(?:ember)?|dec(?:ember)?)";
+    const dayMonth = text.match(new RegExp(`\\b(\\d{1,2})\\s+${monthNamePattern}(?:\\s+(20\\d{2}))?\\b`, "i"));
+    if (dayMonth) return buildInferredNamedDate(dayMonth[1], dayMonth[2], dayMonth[3], timeInfo);
+
+    const monthDay = text.match(new RegExp(`\\b${monthNamePattern}\\s+(\\d{1,2})(?:,?\\s+(20\\d{2}))?\\b`, "i"));
+    if (monthDay) return buildInferredNamedDate(monthDay[2], monthDay[1], monthDay[3], timeInfo);
+
+    return "";
+  }
+
+  function buildInferredNamedDate(day, monthName, year, timeInfo = null) {
     const month = getMonthNumber(monthName);
     if (!month) return "";
 
-    if (year) return buildIsoDate(year, month, day);
-    return buildInferredMonthDayIso(month, day);
+    if (year) return buildIsoDateTime(year, month, day, timeInfo);
+    return buildInferredMonthDayIso(month, day, timeInfo);
   }
 
   function getMonthNumber(monthName) {
@@ -975,44 +2095,62 @@
   }
 
   function extractFacebookReactionCount(root, text) {
-    const labels = collectTextsFromSelectors([
-      '[aria-label*="reaction" i]',
-      '[aria-label*="like" i]',
-      '[aria-label*="suka" i]',
-      '[aria-label*="reaksi" i]'
-    ], root).join(" ");
     const patterns = [
       /([\d.,]+\s*(?:k|m|b|rb|ribu|jt|juta|million|thousand|billion)?)\s+(?:reactions?|likes?|suka|reaksi)\b/i,
       /(?:reactions?|likes?|suka|reaksi)\D{0,20}([\d.,]+\s*(?:k|m|b|rb|ribu|jt|juta|million|thousand|billion)?)/i
     ];
-    const fromLabels = extractCountByPatterns(labels, patterns);
-    if (fromLabels.value !== null) return fromLabels;
+    const metricCandidates = collectFacebookMetricCandidates(root, ["reaction", "reactions", "like", "likes", "suka", "reaksi"], { bottomOnly: true });
+    for (const candidate of metricCandidates) {
+      const result = extractCountByPatterns(candidate, patterns);
+      if (result.value !== null) return result;
+    }
 
-    const fromLines = extractFacebookReactionCountFromLines(text);
+    const fromLines = extractFacebookReactionCountFromLines(text || "");
     if (fromLines.value !== null) return fromLines;
 
-    return extractCountByPatterns(text, patterns);
+    return { value: null, raw: "" };
+  }
+
+  function extractFacebookMetricText(root) {
+    const metricCandidates = collectFacebookMetricCandidates(
+      root,
+      ["comment", "comments", "komentar", "tanggapan", "share", "shares", "dibagikan", "bagikan", "reaction", "reactions", "like", "likes", "suka", "reaksi"],
+      { bottomOnly: true, includeHref: true }
+    );
+
+    return metricCandidates.join("\n");
+  }
+
+  function findFacebookActionLineIndex(lines) {
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = normalizeText(lines[index]).toLowerCase();
+      const matches = ["like", "suka", "comment", "komentari", "share", "bagikan"]
+        .filter((token) => new RegExp(`(^|\\s)${token}($|\\s)`, "i").test(line))
+        .length;
+      if (matches >= 2) return index;
+    }
+
+    return -1;
   }
 
   function extractFacebookCountByLabel(root, text, labels) {
-    const ariaText = collectTextsFromSelectors(labels.flatMap((label) => [
-      `[aria-label*="${label}" i]`,
-      `a[href*="${label}" i]`
-    ]), root).join(" ");
     const labelPattern = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
     const patterns = [
       new RegExp(`([\\d.,]+\\s*(?:k|m|b|rb|ribu|jt|juta|million|thousand|billion)?)\\s+(?:${labelPattern})\\b`, "i"),
       new RegExp(`(?:${labelPattern})\\D{0,20}([\\d.,]+\\s*(?:k|m|b|rb|ribu|jt|juta|million|thousand|billion)?)`, "i")
     ];
-    const fromLines = splitCleanLines(text)
+    const metricCandidates = collectFacebookMetricCandidates(root, labels, { bottomOnly: true, includeHref: true });
+    for (const candidate of metricCandidates) {
+      const result = extractCountByPatterns(candidate, patterns);
+      if (result.value !== null) return result;
+    }
+
+    const fromLines = splitCleanLines(text || "")
       .map((line) => extractCountByPatterns(line, patterns))
       .find((result) => result.value !== null);
     if (fromLines) return fromLines;
 
-    const fromAria = extractCountByPatterns(ariaText, patterns);
-    if (fromAria.value !== null) return fromAria;
-
-    return extractCountByPatterns(text, patterns);
+    return { value: null, raw: "" };
   }
 
   function extractFacebookCommentCount(root, text) {
@@ -1021,6 +2159,7 @@
     const labelPattern = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
     const primaryPatterns = [
       new RegExp(`([\\d.,]+\\s*(?:k|m|b|rb|ribu|jt|juta|million|thousand|billion)?)\\s+(?:${labelPattern})\\b`, "i"),
+      new RegExp(`([\\d.,]+\\s*(?:k|m|b|rb|ribu|jt|juta|million|thousand|billion)?)\\s+(?:beri|lihat|tampilkan)?\\s*(?:${labelPattern})\\b`, "i"),
       new RegExp(`(?:view|lihat|see|tampilkan)\\s*(?:all|semua)?\\s*([\\d.,]+\\s*(?:k|m|b|rb|ribu|jt|juta|million|thousand|billion)?)\\s+(?:${labelPattern})\\b`, "i")
     ];
     const secondaryPatterns = [
@@ -1057,27 +2196,29 @@
     const zeroLine = candidates.find((result) => Number(result.value) === 0);
     if (zeroLine) return zeroLine;
 
-    const ariaText = collectTextsFromSelectors([
-      '[aria-label*="comment" i]',
-      '[aria-label*="komentar" i]',
-      '[aria-label*="tanggapan" i]',
-      'a[href*="comment" i]',
-      'a[href*="comment_id" i]'
-    ], root)
-      .filter((value) => !/^(comment|komentari|write a comment|tulis komentar|add a comment|tambahkan komentar)$/i.test(normalizeText(value)))
-      .join(" ");
-    const primaryAria = extractCountByPatterns(ariaText, primaryPatterns);
-    if (isReasonableFacebookCommentCount(primaryAria, maxReasonableCommentCount)) return primaryAria;
+    const metricCandidates = collectFacebookMetricCandidates(root, labels, { bottomOnly: true, includeHref: true });
+    for (const candidate of metricCandidates) {
+      const primaryCandidate = extractCountByPatterns(candidate, primaryPatterns);
+      if (isReasonableFacebookCommentCount(primaryCandidate, maxReasonableCommentCount)) return primaryCandidate;
 
-    const secondaryLine = lines
-      .map((line) => extractCountByPatterns(line, secondaryPatterns))
-      .find((result) => isReasonableFacebookCommentCount(result, maxReasonableCommentCount));
-    if (secondaryLine) return secondaryLine;
+      const secondaryCandidate = extractCountByPatterns(candidate, secondaryPatterns);
+      if (isReasonableFacebookCommentCount(secondaryCandidate, maxReasonableCommentCount)) return secondaryCandidate;
+    }
 
-    const secondaryAria = extractCountByPatterns(ariaText, secondaryPatterns);
-    if (isReasonableFacebookCommentCount(secondaryAria, maxReasonableCommentCount)) return secondaryAria;
+    const buttonPattern = new RegExp(`([\\d.,]+\\s*(?:k|m|b|rb|ribu|jt|juta|million|thousand|billion)?)\\s+(?:beri|lihat|tampilkan)\\s+(?:${labelPattern})\\b`, "i");
+    const metricButtonNode = findFacebookMetricNodeSnapshots(root, labels).find((item) => buttonPattern.test(item.combined));
+    if (metricButtonNode) {
+      const result = extractCountByPatterns(metricButtonNode.combined, [buttonPattern]);
+      if (isReasonableFacebookCommentCount(result, maxReasonableCommentCount)) return result;
+    }
 
-    return { value: null, raw: "" };
+    const directNumberCandidate = findFacebookMetricNumberByNode(root, (node, combined) => {
+      return /comment|komentar|tanggapan/i.test(combined)
+        || /comment|comment_id/i.test(node.getAttribute?.("href") || "");
+    });
+    if (isReasonableFacebookCommentCount(directNumberCandidate, maxReasonableCommentCount)) return directNumberCandidate;
+
+    return { value: 0, raw: "" };
   }
 
   function isReasonableFacebookCommentCount(result, maxCount) {
@@ -1095,40 +2236,173 @@
     const metricIndex = lines.findIndex((line) => /\b(comments?|komentar|shares?|dibagikan|bagikan)\b/i.test(line));
     if (metricIndex <= 0) return { value: null, raw: "" };
 
+    const fragmentedDigits = [];
     for (let index = metricIndex - 1; index >= Math.max(0, metricIndex - 4); index -= 1) {
       const line = normalizeText(lines[index]);
+      if (/^\d$/.test(line)) {
+        fragmentedDigits.unshift(line);
+        continue;
+      }
+
+      if (fragmentedDigits.length >= 2) {
+        const merged = fragmentedDigits.join("");
+        return {
+          value: parseHumanNumber(merged),
+          raw: merged
+        };
+      }
+
       if (/^[\d.,]+\s*(k|m|b|rb|ribu|jt|juta|million|thousand|billion)?$/i.test(line)) {
         return {
           value: parseHumanNumber(line),
           raw: line
         };
       }
+
+      if (fragmentedDigits.length) break;
+    }
+
+    if (fragmentedDigits.length >= 2) {
+      const merged = fragmentedDigits.join("");
+      return {
+        value: parseHumanNumber(merged),
+        raw: merged
+      };
     }
 
     return { value: null, raw: "" };
   }
 
+  function collectFacebookMetricCandidates(root, labels, options = {}) {
+    return collectFacebookMetricNodeSnapshots(root, labels, options).map((item) => item.combined);
+  }
+
+  function findFacebookMetricNodeSnapshots(root, labels, options = {}) {
+    return collectFacebookMetricNodeSnapshots(root, labels, options);
+  }
+
+  function collectFacebookMetricNodeSnapshots(root, labels, options = {}) {
+    const labelRegex = new RegExp(labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "i");
+    const rootRect = root.getBoundingClientRect();
+    const nodes = [];
+    const seen = new Set();
+
+    [...root.querySelectorAll("a, span, div")].forEach((node) => {
+      const rect = node.getBoundingClientRect?.();
+      if (!rect || rect.width < 10 || rect.height < 10) return;
+      if (options.bottomOnly && rootRect.height > 0 && rect.top < rootRect.top + (rootRect.height * 0.35)) return;
+
+      const leafMetricText = collectFacebookTopRowMetricText(node);
+      const ownText = normalizeText(leafMetricText || node.innerText || node.textContent || "");
+      const aria = normalizeText(node.getAttribute?.("aria-label") || "");
+      const title = normalizeText(node.getAttribute?.("title") || "");
+      const href = options.includeHref ? normalizeText(node.getAttribute?.("href") || "") : "";
+      const combined = normalizeText(`${ownText} ${aria} ${title} ${href}`);
+      if (isFacebookMetricNoiseNode(node, ownText, combined)) return;
+
+      [combined].filter(Boolean).forEach((value) => {
+        if (!labelRegex.test(value)) return;
+        if (seen.has(value)) return;
+        seen.add(value);
+        nodes.push({
+          node,
+          combined: value,
+          ownText,
+          aria,
+          title,
+          href,
+          top: Math.round(rect.top),
+          left: Math.round(rect.left),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height)
+        });
+      });
+    });
+
+    return nodes;
+  }
+
+  function isFacebookMetricNoiseNode(node, ownText, combined) {
+    const normalizedOwnText = normalizeText(ownText).toLowerCase();
+    const normalizedCombined = normalizeText(combined).toLowerCase();
+    const role = normalizeText(node.getAttribute?.("role") || "").toLowerCase();
+    const ariaLabel = normalizeText(node.getAttribute?.("aria-label") || "").toLowerCase();
+
+    if (!normalizedCombined) return true;
+    if (/^(tulis komentar|write a comment|add a comment)(\.\.\.)?$/.test(normalizedOwnText)) return true;
+    if (/^\d+\s+(tulis komentar|write a comment|add a comment)\b/.test(normalizedCombined)) return true;
+    if (/^(like|suka|comment|komentar|komentari|share|bagikan)$/.test(normalizedOwnText)) return true;
+    if (role === "button" && /^(like|suka|comment|komentar|komentari|share|bagikan)$/.test(ariaLabel)) return true;
+    if (/dibagikan kepada publik|shared with public|public/.test(normalizedCombined) && !/\d/.test(normalizedOwnText)) return true;
+
+    return false;
+  }
+
+  function findFacebookMetricNumberByNode(root, predicate) {
+    const rootRect = root.getBoundingClientRect();
+    const nodes = [...root.querySelectorAll("a, span, div")]
+      .filter((node) => {
+        const rect = node.getBoundingClientRect?.();
+        if (!rect || rect.width < 10 || rect.height < 10) return false;
+        if (rootRect.height > 0 && rect.top < rootRect.top + (rootRect.height * 0.35)) return false;
+
+        const ownText = normalizeText(collectFacebookTopRowMetricText(node) || node.innerText || node.textContent || "");
+        if (!isStandaloneMetricNumber(ownText)) return false;
+
+        const combined = normalizeText([
+          node.getAttribute?.("aria-label") || "",
+          node.getAttribute?.("title") || "",
+          node.parentElement?.innerText || "",
+          node.parentElement?.textContent || ""
+        ].join(" "));
+        if (isFacebookMetricNoiseNode(node, ownText, combined)) return false;
+
+        return predicate(node, combined);
+      })
+      .sort((a, b) => {
+        const aRect = a.getBoundingClientRect();
+        const bRect = b.getBoundingClientRect();
+        return aRect.top - bRect.top;
+      });
+
+    const node = nodes[0];
+    if (!node) return { value: null, raw: "" };
+
+    const text = normalizeText(collectFacebookTopRowMetricText(node) || node.innerText || node.textContent || "");
+    return {
+      value: parseHumanNumber(text),
+      raw: text
+    };
+  }
+
+
   function detectFacebookMediaInfo(root, postUrl) {
     const media = collectVisibleMedia(root);
     const imageCount = media.filter((item) => item.kind === "image").length;
+    const detectedVideoCount = media.filter((item) => item.kind === "video").length;
     const videoCount = /\/(?:videos|watch|reel)\//.test(postUrl) || /[?&]v=/.test(postUrl)
-      ? Math.max(1, media.filter((item) => item.kind === "video").length)
-      : media.filter((item) => item.kind === "video").length;
-    const mediaCount = Math.max(1, imageCount + videoCount);
+      ? Math.max(1, detectedVideoCount)
+      : detectedVideoCount;
+    const hasCarousel = videoCount > 0
+      ? hasCarouselControls(root) || detectedVideoCount > 1
+      : imageCount > 1;
+    const mediaCount = videoCount > 0
+      ? hasCarousel ? Math.max(2, imageCount + videoCount) : 1
+      : Math.max(1, imageCount);
 
     if (videoCount > 0) {
       return {
-        contentType: mediaCount > 1 ? "carousel_video" : "video",
-        contentTypeLabel: mediaCount > 1 ? "Carousel video" : "Video",
+        contentType: hasCarousel ? "carousel_video" : "video",
+        contentTypeLabel: hasCarousel ? "Carousel video" : "Video",
         mediaCount,
-        imageCount,
+        imageCount: hasCarousel ? imageCount : 0,
         videoCount
       };
     }
 
     return {
-      contentType: imageCount > 1 ? "carousel_image" : "image",
-      contentTypeLabel: imageCount > 1 ? "Carousel gambar" : "Gambar",
+      contentType: hasCarousel ? "carousel_image" : "image",
+      contentTypeLabel: hasCarousel ? "Carousel gambar" : "Gambar",
       mediaCount,
       imageCount: Math.max(1, imageCount || mediaCount),
       videoCount: 0
@@ -1226,13 +2500,44 @@
     [...root.querySelectorAll("button, [role='button'], span, div")].some((node) => {
       const text = normalizeText(node.textContent || "").toLowerCase();
       const label = normalizeText(node.getAttribute?.("aria-label") || "").toLowerCase();
-      if (!/^(more|lainnya|selengkapnya|see more)$/.test(text) && !/^(more|lainnya|selengkapnya|see more)$/.test(label)) {
+      if (!/^(more|lainnya|selengkapnya|lihat selengkapnya|see more)$/.test(text) && !/^(more|lainnya|selengkapnya|lihat selengkapnya|see more)$/.test(label)) {
         return false;
       }
 
       node.click?.();
       return true;
     });
+  }
+
+  async function expandFacebookCaptionText(root) {
+    const scope = getFacebookMessageContainer(root) || root;
+    const selectors = "button, [role='button'], span, div";
+    const buttons = [...scope.querySelectorAll(selectors)]
+      .filter((node) => {
+        const text = normalizeText(node.textContent || "").toLowerCase();
+        const label = normalizeText(node.getAttribute?.("aria-label") || "").toLowerCase();
+        return /^(lihat selengkapnya|see more|selengkapnya|lainnya|more)$/.test(text)
+          || /^(lihat selengkapnya|see more|selengkapnya|lainnya|more)$/.test(label);
+      });
+
+    if (!buttons.length) return false;
+
+    const target = buttons.sort((a, b) => getNodeDepth(a, root) - getNodeDepth(b, root))[0];
+    target.click?.();
+    await sleep(1000);
+    return true;
+  }
+
+  function getNodeDepth(node, root = document.body) {
+    let depth = 0;
+    let current = node;
+
+    while (current && current !== root && current.parentElement) {
+      depth += 1;
+      current = current.parentElement;
+    }
+
+    return depth;
   }
 
   function findDirectCaption(article, username) {
@@ -1795,21 +3100,46 @@
   }
 
   function buildIsoDate(year, month, day) {
-    const date = new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T00:00:00`);
+    return buildIsoDateTime(year, month, day, null);
+  }
+
+  function buildIsoDateTime(year, month, day, timeInfo = null) {
+    const hours = normalizeHours(timeInfo?.hours ?? 0, timeInfo?.meridiem || "");
+    const minutes = timeInfo?.minutes ?? 0;
+    const date = new Date(
+      `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:00`
+    );
     return Number.isNaN(date.getTime()) ? "" : date.toISOString();
   }
 
-  function buildInferredMonthDayIso(month, day) {
+  function buildInferredMonthDayIso(month, day, timeInfo = null) {
     const now = new Date();
     let year = now.getFullYear();
-    let date = new Date(year, Number(month) - 1, Number(day), 0, 0, 0);
+    let date = new Date(year, Number(month) - 1, Number(day), normalizeHours(timeInfo?.hours ?? 0, timeInfo?.meridiem || ""), timeInfo?.minutes ?? 0, 0);
 
     if (date.getTime() - now.getTime() > 86400000) {
       year -= 1;
-      date = new Date(year, Number(month) - 1, Number(day), 0, 0, 0);
+      date = new Date(year, Number(month) - 1, Number(day), normalizeHours(timeInfo?.hours ?? 0, timeInfo?.meridiem || ""), timeInfo?.minutes ?? 0, 0);
     }
 
     return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+  }
+
+  function applyTimeToIso(isoString, timeInfo = null) {
+    if (!isoString || !timeInfo) return isoString;
+
+    const date = new Date(isoString);
+    if (Number.isNaN(date.getTime())) return isoString;
+
+    date.setHours(normalizeHours(timeInfo.hours ?? 0, timeInfo.meridiem || ""), timeInfo.minutes ?? 0, 0, 0);
+    return date.toISOString();
+  }
+
+  function normalizeHours(hours, meridiem) {
+    const numericHours = Number(hours) || 0;
+    if (meridiem === "pm" && numericHours < 12) return numericHours + 12;
+    if (meridiem === "am" && numericHours === 12) return 0;
+    return numericHours;
   }
 
   function parseHumanNumber(input) {
@@ -1893,18 +3223,33 @@
     });
   }
 
-  async function scrollForMorePosts() {
+  async function scrollForMorePosts(anchor = null) {
     const beforeY = window.scrollY;
     const beforeHeight = document.documentElement.scrollHeight;
     await setStatus("running", "Mencari post berikutnya", "Scroll halaman untuk memuat post yang lebih lama.");
-    window.scrollBy({ top: Math.round(window.innerHeight * 1.35), behavior: "smooth" });
-    await sleep(Math.max(run.options.delayMs, 1300));
+
+    if (run.platform === "facebook" && anchor?.scrollIntoView) {
+      anchor.scrollIntoView({ block: "end", inline: "nearest" });
+      await sleep(300);
+      window.scrollBy({ top: Math.round(window.innerHeight * 0.9), behavior: "smooth" });
+      await sleep(randomBetween(3000, 7000));
+    } else {
+      window.scrollBy({ top: Math.round(window.innerHeight * 1.35), behavior: "smooth" });
+      await sleep(Math.max(run.options.delayMs, 1300));
+    }
+
     return window.scrollY !== beforeY || document.documentElement.scrollHeight !== beforeHeight;
   }
 
   function parseCutoff(value) {
     if (!value) return null;
     const date = new Date(`${value}T00:00:00`);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  function parseStartDate(value) {
+    if (!value) return null;
+    const date = new Date(`${value}T23:59:59.999`);
     return Number.isNaN(date.getTime()) ? null : date;
   }
 
@@ -1922,6 +3267,23 @@
   function cleanPostUrl(platform, url) {
     if (platform === "facebook") return cleanFacebookUrl(url);
     return cleanUrl(url);
+  }
+
+  function getPathname(url) {
+    try {
+      return new URL(url, location.origin).pathname;
+    } catch {
+      return "";
+    }
+  }
+
+  function escapeRegex(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function isElementVisiblyRenderable(element) {
+    const rect = element?.getBoundingClientRect?.();
+    return Boolean(rect && rect.width >= 40 && rect.height >= 40);
   }
 
   function cleanFacebookUrl(url) {
@@ -2016,6 +3378,12 @@
     return Math.min(max, Math.max(min, Number.isFinite(value) ? value : min));
   }
 
+  function randomBetween(min, max) {
+    const lower = Math.min(min, max);
+    const upper = Math.max(min, max);
+    return Math.round(lower + Math.random() * (upper - lower));
+  }
+
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -2032,12 +3400,6 @@
   async function setStatus(state, title, message) {
     await chrome.storage.local.set({
       [STORAGE_STATUS]: {
-        state,
-        title,
-        message,
-        updatedAt: new Date().toISOString()
-      },
-      [LEGACY_STATUS]: {
         state,
         title,
         message,

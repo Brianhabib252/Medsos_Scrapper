@@ -12,6 +12,7 @@
         <div>
           <h1>Social Collector</h1>
           <p>Instagram, TikTok, Facebook: caption, jenis, like, komen, tanggal.</p>
+          <small id="versionText" class="version">Versi -</small>
         </div>
         <span id="stateBadge" class="badge">Idle</span>
       </header>
@@ -27,8 +28,13 @@
           </select>
         </label>
         <label>
+          Tanggal mulai
+          <input id="startDate" type="date">
+        </label>
+        <label>
           Tanggal batas
           <input id="untilDate" type="date" required>
+          <small id="untilDateError" class="field-error" hidden>Masukan Tanggal Batas Postingan</small>
         </label>
         <div class="field-row">
           <label>
