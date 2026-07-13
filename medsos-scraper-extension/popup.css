@@ -16,8 +16,8 @@
 }
 
 body {
-  width: 430px;
-  min-height: 560px;
+  min-width: 320px;
+  min-height: 100vh;
   margin: 0;
   background: var(--bg);
   color: var(--text);
@@ -34,6 +34,9 @@ select {
   display: grid;
   gap: 14px;
   padding: 16px;
+  min-height: 100vh;
+  align-content: start;
+  grid-template-rows: auto auto auto auto minmax(280px, 1fr);
 }
 
 .header {
@@ -53,6 +56,15 @@ p {
   margin: 4px 0 0;
   color: var(--muted);
   font-size: 13px;
+}
+
+.version {
+  display: inline-block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
 }
 
 .badge {
@@ -95,6 +107,13 @@ label {
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
+}
+
+.field-error {
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.3;
 }
 
 input,
@@ -204,7 +223,8 @@ button:disabled {
 }
 
 .results {
-  max-height: 214px;
+  min-height: 280px;
+  max-height: none;
   overflow: auto;
 }
 

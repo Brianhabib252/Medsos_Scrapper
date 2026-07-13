@@ -1,8 +1,6 @@
 const $ = (selector) => document.querySelector(selector);
 const STORAGE_RESULTS = "social_scraper_results";
 const STORAGE_STATUS = "social_scraper_status";
-const LEGACY_RESULTS = "igs_results";
-const LEGACY_STATUS = "igs_status";
 
 const PLATFORM_LABELS = {
   instagram: "Instagram",
@@ -12,7 +10,9 @@ const PLATFORM_LABELS = {
 
 const elements = {
   platformSelect: $("#platformSelect"),
+  startDate: $("#startDate"),
   untilDate: $("#untilDate"),
+  untilDateError: $("#untilDateError"),
   maxPosts: $("#maxPosts"),
   delayMs: $("#delayMs"),
   startBtn: $("#startBtn"),
@@ -24,7 +24,8 @@ const elements = {
   statusText: $("#statusText"),
   countValue: $("#countValue"),
   lastDate: $("#lastDate"),
-  resultsBody: $("#resultsBody")
+  resultsBody: $("#resultsBody"),
+  versionText: $("#versionText")
 };
 
 function formatNumber(value) {
@@ -37,6 +38,11 @@ function formatDate(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function formatPostedDate(item = {}) {
+  if (item.rawDateText) return item.rawDateText;
+  return formatDate(item.postedAt);
 }
 
 function detectPlatformFromUrl(url = "") {
@@ -77,8 +83,20 @@ function sendToTab(tabId, message) {
 
 async function startScraping() {
   if (!elements.untilDate.value) {
+    toggleUntilDateError(true);
     setStatus("Tanggal batas belum diisi", "Pilih tanggal paling lama yang ingin diambil.");
     elements.untilDate.focus();
+    return;
+  }
+
+  toggleUntilDateError(false);
+
+  if (elements.startDate.value && elements.startDate.value < elements.untilDate.value) {
+    setStatus(
+      "Rentang tanggal tidak valid",
+      "Tanggal mulai harus sama atau lebih baru dari tanggal batas."
+    );
+    elements.startDate.focus();
     return;
   }
 
@@ -86,12 +104,16 @@ async function startScraping() {
     const { tab, platform } = await getActiveSocialTab();
     const payload = {
       platform,
+      startDate: elements.startDate.value || "",
       untilDate: elements.untilDate.value,
       maxPosts: Number(elements.maxPosts.value || 100),
       delayMs: Number(elements.delayMs.value || 1400)
     };
     await sendToTab(tab.id, { type: "SCS_START", payload });
-    setStatus("Berjalan", `Extension mulai membaca post yang terlihat di halaman ${PLATFORM_LABELS[platform]}.`);
+    const rangeText = elements.startDate.value
+      ? ` dalam rentang ${elements.untilDate.value} sampai ${elements.startDate.value}`
+      : ` sampai tanggal batas ${elements.untilDate.value}`;
+    setStatus("Berjalan", `Extension mulai membaca post yang terlihat di halaman ${PLATFORM_LABELS[platform]}${rangeText}.`);
   } catch (error) {
     setStatus("Tidak bisa mulai", error.message);
   }
@@ -112,6 +134,15 @@ function setStatus(title, text) {
   elements.statusText.textContent = text;
 }
 
+function toggleUntilDateError(show) {
+  elements.untilDateError.hidden = !show;
+}
+
+function renderVersion() {
+  const version = chrome.runtime.getManifest?.().version || "-";
+  elements.versionText.textContent = `Versi ${version}`;
+}
+
 function renderStatus(status = {}) {
   const running = status.state === "running";
   elements.stateBadge.textContent = running ? "Running" : "Idle";
@@ -126,7 +157,7 @@ function renderStatus(status = {}) {
 
 function renderResults(results = []) {
   elements.countValue.textContent = results.length.toLocaleString("id-ID");
-  elements.lastDate.textContent = formatDate(results.at(-1)?.postedAt);
+  elements.lastDate.textContent = formatPostedDate(results.at(-1) || {});
   elements.exportBtn.disabled = results.length === 0;
 
   if (!results.length) {
@@ -146,7 +177,7 @@ function renderResults(results = []) {
           <td>${escapeHtml(formatContentType(item))}</td>
           <td>${escapeHtml(formatNumber(item.likeCount))}</td>
           <td>${escapeHtml(formatNumber(item.commentCount))}</td>
-          <td>${escapeHtml(formatDate(item.postedAt))}</td>
+          <td>${escapeHtml(formatPostedDate(item))}</td>
         </tr>
       `;
     })
@@ -175,21 +206,16 @@ function escapeHtml(value) {
 }
 
 async function hydrate() {
-  const storage = await chrome.storage.local.get([
-    STORAGE_STATUS,
-    STORAGE_RESULTS,
-    LEGACY_STATUS,
-    LEGACY_RESULTS
-  ]);
-  const status = storage[STORAGE_STATUS] || storage[LEGACY_STATUS];
-  const results = storage[STORAGE_RESULTS] || storage[LEGACY_RESULTS] || [];
+  const storage = await chrome.storage.local.get([STORAGE_STATUS, STORAGE_RESULTS]);
+  const status = storage[STORAGE_STATUS];
+  const results = storage[STORAGE_RESULTS] || [];
   renderStatus(status);
   renderResults(results);
 }
 
 async function exportExcel() {
-  const storage = await chrome.storage.local.get([STORAGE_RESULTS, LEGACY_RESULTS]);
-  const results = storage[STORAGE_RESULTS] || storage[LEGACY_RESULTS] || [];
+  const storage = await chrome.storage.local.get([STORAGE_RESULTS]);
+  const results = storage[STORAGE_RESULTS] || [];
   if (!results?.length) return;
 
   const dataHeaders = [
@@ -219,7 +245,7 @@ async function exportExcel() {
     item.commentCount ?? "",
     item.shareCount ?? "",
     item.savedCount ?? "",
-    formatDateTimeForExcel(item.postedAt),
+    item.rawDateText || formatDateTimeForExcel(item.postedAt),
     formatDateTimeForExcel(item.scrapedAt)
   ]);
   const summaryRows = buildSummaryRows(results);
@@ -231,15 +257,30 @@ async function exportExcel() {
   const blob = new Blob([workbook], { type: "application/vnd.ms-excel;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const date = new Date().toISOString().slice(0, 10);
+  const platformSlug = resolveExportPlatformSlug(results);
 
   chrome.downloads.download(
     {
       url,
-      filename: `social-post-data-${date}.xls`,
+      filename: `${platformSlug}-post-data-${date}.xls`,
       saveAs: true
     },
     () => setTimeout(() => URL.revokeObjectURL(url), 1000)
   );
+}
+
+function resolveExportPlatformSlug(results = []) {
+  const uniquePlatforms = [...new Set(
+    results
+      .map((item) => String(item?.platform || "").toLowerCase().trim())
+      .filter(Boolean)
+  )];
+
+  if (uniquePlatforms.length === 1 && PLATFORM_LABELS[uniquePlatforms[0]]) {
+    return uniquePlatforms[0];
+  }
+
+  return "social";
 }
 
 function buildSummaryRows(results) {
@@ -387,9 +428,7 @@ function escapeXml(value) {
 async function clearResults() {
   await chrome.storage.local.set({
     [STORAGE_RESULTS]: [],
-    [STORAGE_STATUS]: { state: "idle", title: "Siap", message: "Hasil lokal sudah dibersihkan." },
-    [LEGACY_RESULTS]: [],
-    [LEGACY_STATUS]: { state: "idle", title: "Siap", message: "Hasil lokal sudah dibersihkan." }
+    [STORAGE_STATUS]: { state: "idle", title: "Siap", message: "Hasil lokal sudah dibersihkan." }
   });
   await hydrate();
 }
@@ -398,13 +437,17 @@ elements.startBtn.addEventListener("click", startScraping);
 elements.stopBtn.addEventListener("click", stopScraping);
 elements.exportBtn.addEventListener("click", exportExcel);
 elements.clearBtn.addEventListener("click", clearResults);
+elements.untilDate.addEventListener("input", () => {
+  if (elements.untilDate.value) {
+    toggleUntilDateError(false);
+  }
+});
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
   if (changes[STORAGE_STATUS]) renderStatus(changes[STORAGE_STATUS].newValue);
   if (changes[STORAGE_RESULTS]) renderResults(changes[STORAGE_RESULTS].newValue || []);
-  if (changes[LEGACY_STATUS] && !changes[STORAGE_STATUS]) renderStatus(changes[LEGACY_STATUS].newValue);
-  if (changes[LEGACY_RESULTS] && !changes[STORAGE_RESULTS]) renderResults(changes[LEGACY_RESULTS].newValue || []);
 });
 
 hydrate();
+renderVersion();
