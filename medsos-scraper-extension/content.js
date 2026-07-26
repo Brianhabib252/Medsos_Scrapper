@@ -1,6 +1,20 @@
 (() => {
   const STORAGE_RESULTS = "social_scraper_results";
   const STORAGE_STATUS = "social_scraper_status";
+  const FACEBOOK_POST_ROOT_SELECTOR = [
+    '[role="article"]',
+    "article",
+    'div[data-pagelet^="FeedUnit"]',
+    "main div[aria-posinset]",
+    '[role="main"] div[aria-posinset]'
+  ].join(", ");
+  const FACEBOOK_POST_MEDIA_LINK_SELECTOR = [
+    'a[href*="/photo/"][href*="fbid="]',
+    'a[href*="photo.php"][href*="fbid="]',
+    'a[href*="/videos/"]',
+    'a[href*="/watch/"]',
+    'a[href*="/reel/"]'
+  ].join(", ");
 
   const PLATFORM_CONFIG = {
     instagram: {
@@ -29,6 +43,7 @@
 
   let run = {
     active: false,
+    sessionId: 0,
     platform: "",
     seen: new Set(),
     results: [],
@@ -64,11 +79,22 @@
       return;
     }
 
+    const sessionId = run.sessionId + 1;
+    run = {
+      ...run,
+      active: true,
+      sessionId,
+      platform
+    };
+
     const stored = await chrome.storage.local.get([STORAGE_RESULTS]);
+    if (!isRunActive(sessionId)) return;
+
     const existing = Array.isArray(stored[STORAGE_RESULTS]) ? stored[STORAGE_RESULTS] : [];
 
     run = {
       active: true,
+      sessionId,
       platform,
       seen: new Set(existing.map((item) => item.url).filter(Boolean)),
       results: existing,
@@ -76,7 +102,7 @@
       options: {
         startDate: options.startDate || "",
         untilDate: options.untilDate || "",
-        maxPosts: clamp(Number(options.maxPosts || 100), 1, 1000),
+        maxPosts: clamp(Number(options.maxPosts || 300), 1, 1000),
         delayMs: clamp(Number(options.delayMs || 1400), 600, 5000)
       }
     };
@@ -86,28 +112,60 @@
       "Mulai scraping",
       `Membaca daftar post dari halaman ${PLATFORM_CONFIG[platform].label}.`
     );
-    scrapeLoop().catch(async (error) => {
+    scrapeLoop(sessionId).catch(async (error) => {
+      if (!isRunActive(sessionId)) return;
       run.active = false;
       await setStatus("idle", "Terjadi masalah", error.message || "Scraper berhenti.");
     });
   }
 
-  async function stop(title = "Berhenti", message = "Scraper berhenti.") {
+  function isRunActive(sessionId) {
+    return run.active && run.sessionId === sessionId;
+  }
+
+  async function stop(title = "Berhenti", message = "Scraper berhenti.", sessionId = null) {
+    if (sessionId !== null && run.sessionId !== sessionId) return;
     run.active = false;
     await setStatus("idle", title, message);
   }
 
-  async function scrapeLoop() {
+  async function appendPostResult(postData, sessionId) {
+    if (!isRunActive(sessionId) || run.addedCount >= run.options.maxPosts) {
+      return false;
+    }
+
+    run.results.push(postData);
+    run.addedCount += 1;
+    await chrome.storage.local.set({ [STORAGE_RESULTS]: run.results });
+    return true;
+  }
+
+  async function finishRun(sessionId) {
+    if (!isRunActive(sessionId)) return;
+
+    if (run.addedCount >= run.options.maxPosts) {
+      await stop(
+        "Mencapai batas post",
+        `Berhasil mengambil maksimal ${run.options.maxPosts} post baru.`,
+        sessionId
+      );
+      return;
+    }
+
+    await stop("Selesai", `Mengambil ${run.addedCount} post baru.`, sessionId);
+  }
+
+  async function scrapeLoop(sessionId) {
     const startDate = parseStartDate(run.options.startDate);
     const cutoff = parseCutoff(run.options.untilDate);
     if (run.platform === "facebook") {
-      await scrapeFacebookFeedLoop(startDate, cutoff);
+      await scrapeFacebookFeedLoop(startDate, cutoff, sessionId);
       return;
     }
 
     let staleScrolls = 0;
 
-    while (run.active && run.addedCount < run.options.maxPosts) {
+    while (isRunActive(sessionId) && run.addedCount < run.options.maxPosts) {
       const links = collectPostLinks(run.platform);
       const nextIndex = links.findIndex((link) => !run.seen.has(getPostElementUrl(run.platform, link)));
       const nextLink = nextIndex >= 0 ? links[nextIndex] : null;
@@ -117,7 +175,7 @@
         staleScrolls = moved ? 0 : staleScrolls + 1;
 
         if (staleScrolls >= 4) {
-          await stop("Selesai", "Tidak ada post baru yang terlihat setelah scroll.");
+          await stop("Selesai", "Tidak ada post baru yang terlihat setelah scroll.", sessionId);
           return;
         }
         continue;
@@ -137,6 +195,8 @@
       );
 
       const postData = await scrapePostFromLink(nextLink, postUrl, linkContext);
+      if (!isRunActive(sessionId)) return;
+
       if (postData) {
         if (isNewerThanStartDate(startDate, postData)) {
           await setStatus(
@@ -161,35 +221,32 @@
 
           await stop(
             "Mencapai tanggal batas",
-            `Post ${formatDateForStatus(postData.postedAt)} lebih lama dari tanggal batas, jadi tidak disimpan.`
+            `Post ${formatDateForStatus(postData.postedAt)} lebih lama dari tanggal batas, jadi tidak disimpan.`,
+            sessionId
           );
           return;
         }
 
-        run.results.push(postData);
-        run.addedCount += 1;
-        await chrome.storage.local.set({ [STORAGE_RESULTS]: run.results });
+        if (!await appendPostResult(postData, sessionId)) break;
       }
 
       await sleep(run.options.delayMs);
     }
 
-    await stop("Selesai", `Mengambil ${run.addedCount} post baru.`);
+    await finishRun(sessionId);
   }
 
-  async function scrapeFacebookFeedLoop(startDate, cutoff) {
+  async function scrapeFacebookFeedLoop(startDate, cutoff, sessionId) {
     let staleScrolls = 0;
 
-    while (run.active && run.addedCount < run.options.maxPosts) {
+    while (isRunActive(sessionId) && run.addedCount < run.options.maxPosts) {
       const articles = collectFacebookFeedArticles();
-      let processedVisibleArticle = false;
 
-      for (let index = 0; index < articles.length && run.active && run.addedCount < run.options.maxPosts; index += 1) {
+      for (let index = 0; index < articles.length && isRunActive(sessionId) && run.addedCount < run.options.maxPosts; index += 1) {
         const article = articles[index];
         const postUrl = getPostElementUrl("facebook", article);
         if (!postUrl || run.seen.has(postUrl)) continue;
 
-        processedVisibleArticle = true;
         run.seen.add(postUrl);
 
         const linkContext = {
@@ -204,6 +261,8 @@
         );
 
         const postData = await scrapeFacebookPostFromLink(article, postUrl, linkContext);
+        if (!isRunActive(sessionId)) return;
+
         if (!postData) {
           await sleep(run.options.delayMs);
           continue;
@@ -232,18 +291,17 @@
 
           await stop(
             "Mencapai tanggal batas",
-            `Post ${formatDateForStatus(postData.postedAt)} lebih lama dari tanggal batas, jadi tidak disimpan.`
+            `Post ${formatDateForStatus(postData.postedAt)} lebih lama dari tanggal batas, jadi tidak disimpan.`,
+            sessionId
           );
           return;
         }
 
-        run.results.push(postData);
-        run.addedCount += 1;
-        await chrome.storage.local.set({ [STORAGE_RESULTS]: run.results });
+        if (!await appendPostResult(postData, sessionId)) break;
         await sleep(run.options.delayMs);
       }
 
-      if (!run.active || run.addedCount >= run.options.maxPosts) {
+      if (!isRunActive(sessionId) || run.addedCount >= run.options.maxPosts) {
         break;
       }
 
@@ -251,13 +309,13 @@
       const moved = await scrollForMorePosts(lastArticle);
       staleScrolls = moved ? 0 : staleScrolls + 1;
 
-      if (staleScrolls >= 4 || (!processedVisibleArticle && !moved)) {
-        await stop("Selesai", "Tidak ada post Facebook baru yang terlihat setelah beberapa kali scroll.");
+      if (staleScrolls >= 4) {
+        await stop("Selesai", "Tidak ada post Facebook baru yang terlihat setelah beberapa kali scroll.", sessionId);
         return;
       }
     }
 
-    await stop("Selesai", `Mengambil ${run.addedCount} post baru.`);
+    await finishRun(sessionId);
   }
 
   function resolvePlatform(requestedPlatform) {
@@ -387,11 +445,15 @@
 
   function collectFacebookFeedArticles() {
     const unique = new Map();
-    const articleRoots = [...document.querySelectorAll('[role="article"], article, div[data-pagelet^="FeedUnit"]')];
+    const articleRoots = [...document.querySelectorAll(FACEBOOK_POST_ROOT_SELECTOR)];
     const contextualRoots = [...document.querySelectorAll('[data-ad-preview="message"], [data-ad-comet-preview="message"], [data-testid="post_message"]')]
-      .map((node) => node.closest('[role="article"], article, div[data-pagelet^="FeedUnit"]') || normalizeFacebookPostRoot(findFacebookPostRootFromNode(node)))
+      .map((node) => node.closest(FACEBOOK_POST_ROOT_SELECTOR) || normalizeFacebookPostRoot(findFacebookPostRootFromNode(node)))
       .filter(Boolean);
-    const postRoots = [...new Set([...articleRoots, ...contextualRoots])]
+    const mediaRoots = [...document.querySelectorAll(FACEBOOK_POST_MEDIA_LINK_SELECTOR)]
+      .filter((link) => link.closest('[role="main"], main'))
+      .map((link) => findFacebookMediaPostRoot(link))
+      .filter(Boolean);
+    const postRoots = [...new Set([...articleRoots, ...contextualRoots, ...mediaRoots])]
       .filter(isLikelyFacebookPostRoot)
       .filter(isVisibleFacebookFeedRoot)
       .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
@@ -1036,7 +1098,7 @@
     const dialogRoot = getFacebookDialogRoot();
     if (dialogRoot) return dialogRoot;
 
-    const articles = [...document.querySelectorAll('[role="article"], article, div[data-pagelet^="FeedUnit"]')];
+    const articles = [...document.querySelectorAll(FACEBOOK_POST_ROOT_SELECTOR)];
     if (postId) {
       const matchingArticle = articles.find((article) => {
         return [...article.querySelectorAll("a[href]")].some((link) => getPostId("facebook", link.href) === postId);
@@ -1051,10 +1113,11 @@
   }
 
   function getFacebookPostCardRoot(link) {
-    if (link.matches?.('[role="article"], article, div[data-pagelet^="FeedUnit"]')) return link;
+    if (link.__scsPostHref || link.__scsFacebookPostRoot) return link;
+    if (link.matches?.(FACEBOOK_POST_ROOT_SELECTOR)) return link;
 
     return normalizeFacebookPostRoot(
-      link.closest('[role="article"], article, div[data-pagelet^="FeedUnit"]')
+      link.closest(FACEBOOK_POST_ROOT_SELECTOR)
       || findFacebookPostRootFromNode(link)
       || link
     );
@@ -1067,12 +1130,18 @@
     const text = normalizeText(root.innerText || root.textContent || "");
     if (text.length < 25) return false;
 
-    const hasPostAction = /\b(like|comment|share|suka|komentar|bagikan)\b/i.test(text);
+    const hasPostAction = hasFacebookPostActionSet(root)
+      || /\b(like|comment|share|suka|komentar|bagikan)\b/i.test(text);
     const hasDate = Boolean(extractFacebookDate(root));
     const hasCaption = Boolean(extractFacebookCaption(root));
-    const hasMedia = root.querySelectorAll?.("img, video").length > 0;
+    const hasMedia = collectVisibleMedia(root).length > 0;
+    const hasPostLink = Boolean(findBestFacebookPostLink(root));
 
-    return (hasDate || hasCaption) && (hasPostAction || hasMedia);
+    if (hasDate || hasCaption) {
+      return hasPostAction || hasMedia;
+    }
+
+    return hasPostLink && hasMedia && hasFacebookPostActionSet(root);
   }
 
   function isVisibleFacebookFeedRoot(root) {
@@ -1110,7 +1179,7 @@
     if (text.length > 48 && !token) score -= 90;
     if (/\b(?:website|facebook|twitter|youtube|tiktok|selengkapnya|tampilkan lebih sedikit)\b/i.test(text)) score -= 120;
 
-    const root = link.closest('[role="article"], article, div[data-pagelet^="FeedUnit"]');
+    const root = link.closest(FACEBOOK_POST_ROOT_SELECTOR);
     if (root && root.querySelector('[data-ad-preview="message"], [data-ad-comet-preview="message"]')) score += 20;
 
     return score;
@@ -1145,11 +1214,66 @@
     return best;
   }
 
+  function findFacebookMediaPostRoot(link, maxDepth = 18) {
+    let current = link;
+    const maxHeight = Math.max(4800, (window.innerHeight || 0) * 8);
+
+    for (let depth = 0; current && depth < maxDepth; depth += 1) {
+      const rect = current.getBoundingClientRect?.();
+      if (!rect || rect.width < 320 || rect.height < 140 || rect.height > maxHeight) {
+        current = current.parentElement;
+        continue;
+      }
+
+      const linkCount = current.querySelectorAll?.("a[href]").length || 0;
+      if (linkCount > 60) {
+        current = current.parentElement;
+        continue;
+      }
+
+      const hasMedia = collectVisibleMedia(current).length > 0;
+      const headerBand = getFacebookHeaderBand(current);
+      const authorNode = findFacebookAuthorNode(current, headerBand);
+
+      if (hasFacebookPostActionSet(current) && hasMedia && authorNode) {
+        current.__scsFacebookPostRoot = true;
+        return current;
+      }
+
+      current = current.parentElement;
+    }
+
+    return null;
+  }
+
+  function collectFacebookPostActionText(root) {
+    if (!root?.querySelectorAll) return "";
+
+    return normalizeText([...root.querySelectorAll('button, [role="button"]')]
+      .map((node) => [
+        node.getAttribute?.("aria-label") || "",
+        node.getAttribute?.("title") || "",
+        node.innerText || node.textContent || ""
+      ].join(" "))
+      .join(" "));
+  }
+
+  function hasFacebookPostActionSet(root) {
+    const actionText = collectFacebookPostActionText(root);
+    if (!actionText) return false;
+
+    const hasLike = /\b(like|suka|beri reaksi)\b/i.test(actionText);
+    const hasComment = /\b(comment|komentar|beri komentar)\b/i.test(actionText);
+    const hasShare = /\b(share|bagikan|kirim ini ke teman|posting di profil)\b/i.test(actionText);
+    return hasLike && hasComment && hasShare;
+  }
+
   function getFacebookProfileSlug() {
     try {
       const path = new URL(window.location.href).pathname
         .replace(/^\/+|\/+$/g, "")
         .split("/")[0];
+      if (/^profile\.php$/i.test(path)) return "";
       return normalizeText(path || "");
     } catch (_) {
       return "";
@@ -1165,6 +1289,7 @@
   }
 
   function normalizeFacebookPostRoot(root, maxDepth = 12) {
+    if (root?.__scsPostHref || root?.__scsFacebookPostRoot) return root;
     if (!root?.parentElement) return root;
     return findFacebookPostRootFromNode(root, maxDepth) || root;
   }
@@ -1181,16 +1306,19 @@
     const linkCount = candidate.querySelectorAll("a[href]").length;
     const mediaCount = candidate.querySelectorAll("img, video").length;
     const hasCaption = Boolean(candidate.querySelector('[data-ad-preview="message"], [data-ad-comet-preview="message"], [data-testid="post_message"]'));
-    const hasPostAction = /\b(like|comment|share|suka|komentar|bagikan)\b/i.test(text);
-    const hasShareAction = /\b(share|bagikan)\b/i.test(text);
+    const actionText = collectFacebookPostActionText(candidate);
+    const hasPostAction = hasFacebookPostActionSet(candidate)
+      || /\b(like|comment|share|suka|komentar|bagikan)\b/i.test(text);
+    const hasShareAction = /\b(share|bagikan|kirim ini ke teman|posting di profil)\b/i.test(`${text} ${actionText}`);
     const hasReplyAction = /\b(reply|balas)\b/i.test(text);
     const hasEditedCommentText = /\b(diedit|edited)\b/i.test(text);
     const hasTimestampishLink = hasFacebookTimestampishLink(candidate);
     const sourceContained = candidate.contains(sourceNode);
-    const isStructuredRoot = candidate.matches?.('[role="article"], article, div[data-pagelet^="FeedUnit"]');
+    const isStructuredRoot = candidate.matches?.(FACEBOOK_POST_ROOT_SELECTOR);
     const headerBand = getFacebookHeaderBand(candidate);
     const authorNode = findFacebookAuthorNode(candidate, headerBand);
     const authorText = normalizeText(authorNode?.innerText || authorNode?.textContent || "");
+    const profileSlug = getFacebookProfileSlug();
     const matchesPageAuthor = isLikelyFacebookPageAuthorName(authorText);
     const overLarge = rect.height > window.innerHeight * 2.8 || linkCount > 80;
 
@@ -1199,7 +1327,7 @@
     if (isStructuredRoot) score += 110;
     if (authorNode) score += 90;
     if (matchesPageAuthor) score += 180;
-    if (authorNode && !matchesPageAuthor) score -= 120;
+    if (authorNode && profileSlug && !matchesPageAuthor) score -= 120;
     if (hasCaption) score += 100;
     if (mediaCount > 0) score += 50;
     if (hasPostAction) score += 90;
@@ -1992,7 +2120,15 @@
         }
       : null;
 
-    const numericToken = text.match(/\b(?:20\d{2}[./-]\d{1,2}[./-]\d{1,2}|\d{1,2}[./-]\d{1,2}[./-]20\d{2}|\d{1,2}[./-]\d{1,2})\b/);
+    const named = parseNamedMonthDate(text, timeInfo);
+    if (named) return named;
+
+    // Facebook commonly renders time as "12.19". Remove it before looking for
+    // numeric dates so the time is not interpreted as 19 December.
+    const textWithoutTime = timeMatch
+      ? normalizeText(`${text.slice(0, timeMatch.index)} ${text.slice((timeMatch.index || 0) + timeMatch[0].length)}`)
+      : text;
+    const numericToken = textWithoutTime.match(/\b(?:20\d{2}[./-]\d{1,2}[./-]\d{1,2}|\d{1,2}[./-]\d{1,2}[./-]20\d{2}|\d{1,2}[./-]\d{1,2})\b/);
     if (numericToken?.[0]) {
       const numeric = normalizeTikTokDate(numericToken[0]);
       if (numeric) return applyTimeToIso(numeric, timeInfo);
@@ -2046,9 +2182,6 @@
       return date.toISOString();
     }
     if (/\b(just now|baru saja)\b/i.test(text)) return new Date().toISOString();
-
-    const named = parseNamedMonthDate(text, timeInfo);
-    if (named) return named;
 
     return "";
   }

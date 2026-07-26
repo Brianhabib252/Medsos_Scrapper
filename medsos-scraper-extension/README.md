@@ -1,6 +1,6 @@
 # Social Post Data Collector
 
-Versi saat ini: `1.0.0`
+Versi saat ini: `1.1.1`
 
 Chrome extension lokal berbentuk side panel untuk mengambil data postingan yang terlihat dari:
 
@@ -36,6 +36,9 @@ Semua hasil disimpan lokal di `chrome.storage.local` lalu bisa diekspor ke file 
 - `Tanggal mulai` opsional untuk membatasi hanya rentang tanggal tertentu.
 - Validasi form langsung di panel, termasuk pesan merah bila `Tanggal batas` kosong.
 - Nama file export mengikuti platform hasil scrape, misalnya `facebook-post-data-2026-07-10.xls`.
+- Sheet `Ringkasan` memakai format horizontal dengan nama metrik sebagai kolom.
+- Ekspor gabungan menampilkan total like dan komentar terpisah untuk Facebook, Instagram, dan TikTok.
+- Nilai awal `Maks. post` adalah 300 dan diterapkan sebagai batas hasil baru pada setiap proses.
 - Hasil lokal bisa dibersihkan tanpa menghapus extension.
 
 ## Cara pasang

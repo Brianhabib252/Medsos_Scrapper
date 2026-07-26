@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Social Post Data Collector",
   "description": "Mengambil data dasar postingan Instagram, TikTok, dan Facebook yang terlihat di browser user dan menyimpannya secara lokal.",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",

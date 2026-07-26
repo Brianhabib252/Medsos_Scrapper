@@ -106,7 +106,7 @@ async function startScraping() {
       platform,
       startDate: elements.startDate.value || "",
       untilDate: elements.untilDate.value,
-      maxPosts: Number(elements.maxPosts.value || 100),
+      maxPosts: Number(elements.maxPosts.value || 300),
       delayMs: Number(elements.delayMs.value || 1400)
     };
     await sendToTab(tab.id, { type: "SCS_START", payload });
@@ -284,6 +284,10 @@ function resolveExportPlatformSlug(results = []) {
 }
 
 function buildSummaryRows(results) {
+  const normalizedResults = results.map((item) => ({
+    ...item,
+    summaryPlatform: normalizeSummaryPlatform(item.platform)
+  }));
   const validDates = results
     .map((item) => new Date(item.postedAt))
     .filter((date) => !Number.isNaN(date.getTime()))
@@ -298,15 +302,18 @@ function buildSummaryRows(results) {
   const totalComments = sumField(results, "commentCount");
   const totalShares = sumField(results, "shareCount");
   const totalSaved = sumField(results, "savedCount");
-  const instagramPosts = results.filter((item) => item.platform === "instagram" || !item.platform).length;
-  const tiktokPosts = results.filter((item) => item.platform === "tiktok").length;
-  const facebookPosts = results.filter((item) => item.platform === "facebook").length;
+  const instagramResults = normalizedResults.filter((item) => item.summaryPlatform === "instagram");
+  const tiktokResults = normalizedResults.filter((item) => item.summaryPlatform === "tiktok");
+  const facebookResults = normalizedResults.filter((item) => item.summaryPlatform === "facebook");
+  const instagramPosts = instagramResults.length;
+  const tiktokPosts = tiktokResults.length;
+  const facebookPosts = facebookResults.length;
   const carouselImagePosts = results.filter((item) => item.contentType === "carousel_image").length;
   const videoPosts = results.filter((item) => item.contentType === "video" || item.contentType === "carousel_video" || Number(item.videoCount) > 0).length;
   const averagePostsPerWeek = totalPosts ? totalPosts / weekSpan : 0;
+  const platformCount = new Set(normalizedResults.map((item) => item.summaryPlatform).filter(Boolean)).size;
 
-  return [
-    ["Metrik", "Nilai"],
+  const summaryEntries = [
     ["Jumlah postingan", totalPosts],
     ["Jumlah postingan Instagram", instagramPosts],
     ["Jumlah postingan TikTok", tiktokPosts],
@@ -322,6 +329,27 @@ function buildSummaryRows(results) {
     ["Periode posting terlama", oldestDate ? formatDateTimeForExcel(oldestDate.toISOString()) : ""],
     ["Jumlah minggu dalam data", weekSpan]
   ];
+
+  if (platformCount > 1) {
+    summaryEntries.push(
+      ["Jumlah Like Facebook", sumField(facebookResults, "likeCount")],
+      ["Jumlah Like Instagram", sumField(instagramResults, "likeCount")],
+      ["Jumlah Like TikTok", sumField(tiktokResults, "likeCount")],
+      ["Jumlah Komentar Facebook", sumField(facebookResults, "commentCount")],
+      ["Jumlah Komentar Instagram", sumField(instagramResults, "commentCount")],
+      ["Jumlah Komentar TikTok", sumField(tiktokResults, "commentCount")]
+    );
+  }
+
+  return [
+    summaryEntries.map(([label]) => label),
+    summaryEntries.map(([, value]) => value)
+  ];
+}
+
+function normalizeSummaryPlatform(platform) {
+  const normalized = String(platform || "instagram").toLowerCase().trim();
+  return PLATFORM_LABELS[normalized] ? normalized : "";
 }
 
 function sumField(items, field) {
